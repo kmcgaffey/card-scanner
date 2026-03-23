@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["full"] }
 urlencoding = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
 
 [[example]]
 name = "fetch_product"

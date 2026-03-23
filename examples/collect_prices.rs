@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -14,6 +15,88 @@ const RETRY_BACKOFF_MS: u64 = 5000;
 /// Listings to fetch per card when finding the lowest English price.
 /// We grab a few extra to skip past non-English custom listings.
 const LISTING_FETCH_SIZE: u32 = 10;
+
+/// A collection profile loaded from profiles.toml.
+#[derive(Debug)]
+struct Profile {
+    name: String,
+    product_line: String,
+    set_name: String,
+    product_type: String,
+    db_path: PathBuf,
+}
+
+fn load_profile(profile_name: &str) -> Profile {
+    let config_path = PathBuf::from("profiles.toml");
+    let content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", config_path.display(), e);
+        eprintln!("Create a profiles.toml file with your collection profiles.");
+        std::process::exit(1);
+    });
+
+    let table: HashMap<String, toml::Value> = toml::from_str(&content).unwrap_or_else(|e| {
+        eprintln!("Failed to parse {}: {}", config_path.display(), e);
+        std::process::exit(1);
+    });
+
+    let profile_value = table.get(profile_name).unwrap_or_else(|| {
+        let available: Vec<&String> = table.keys().collect();
+        eprintln!("Profile '{}' not found in profiles.toml", profile_name);
+        eprintln!("Available profiles: {}", available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        std::process::exit(1);
+    });
+
+    let t = profile_value.as_table().unwrap_or_else(|| {
+        eprintln!("Profile '{}' is not a valid table", profile_name);
+        std::process::exit(1);
+    });
+
+    let get_str = |key: &str| -> String {
+        t.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                eprintln!("Profile '{}' missing required field '{}'", profile_name, key);
+                std::process::exit(1);
+            })
+            .to_string()
+    };
+
+    Profile {
+        name: profile_name.to_string(),
+        product_line: get_str("product_line"),
+        set_name: get_str("set_name"),
+        product_type: get_str("product_type"),
+        db_path: PathBuf::from(get_str("db_path")),
+    }
+}
+
+fn list_profiles() {
+    let config_path = PathBuf::from("profiles.toml");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("No profiles.toml found.");
+            return;
+        }
+    };
+    let table: HashMap<String, toml::Value> = match toml::from_str(&content) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Failed to parse profiles.toml: {}", e);
+            return;
+        }
+    };
+
+    println!("Available profiles:");
+    for (name, value) in &table {
+        if let Some(t) = value.as_table() {
+            let set = t.get("set_name").and_then(|v| v.as_str()).unwrap_or("?");
+            let line = t.get("product_line").and_then(|v| v.as_str()).unwrap_or("?");
+            let db = t.get("db_path").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("  {:<20} {} / {} -> {}", name, line, set, db);
+        }
+    }
+}
 
 /// Keywords in custom listing titles that indicate a non-English card.
 const NON_ENGLISH_KEYWORDS: &[&str] = &[
@@ -351,14 +434,30 @@ where
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let db_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("spiritforged_prices.db"));
+    let args: Vec<String> = std::env::args().collect();
+    let profile_name = args.get(1).map(|s| s.as_str());
 
-    println!("Database: {}", db_path.display());
+    match profile_name {
+        Some("--list") | Some("-l") => {
+            list_profiles();
+            return Ok(());
+        }
+        None => {
+            eprintln!("Usage: cargo run --example collect_prices -- <profile>");
+            eprintln!("       cargo run --example collect_prices -- --list");
+            list_profiles();
+            return Ok(());
+        }
+        _ => {}
+    }
 
-    let conn = Connection::open(&db_path)?;
+    let profile = load_profile(profile_name.unwrap());
+    println!("=== Profile: {} ===", profile.name);
+    println!("  Product Line: {}", profile.product_line);
+    println!("  Set: {}", profile.set_name);
+    println!("  Database: {}", profile.db_path.display());
+
+    let conn = Connection::open(&profile.db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     init_db(&conn);
 
@@ -366,14 +465,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let now = Utc::now().to_rfc3339();
 
     // --- Phase 1: Discover all cards in the set ---
-    println!("\n=== Phase 1: Discovering cards in Spiritforged set ===");
+    println!("\n=== Phase 1: Discovering cards in {} set ===", profile.set_name);
 
     let filters = SearchTermFilters {
-        product_line_name: Some(vec![
-            "Riftbound: League of Legends Trading Card Game".into(),
-        ]),
-        set_name: Some(vec!["Spiritforged".into()]),
-        product_type_name: Some(vec!["Cards".into()]),
+        product_line_name: Some(vec![profile.product_line.clone()]),
+        set_name: Some(vec![profile.set_name.clone()]),
+        product_type_name: Some(vec![profile.product_type.clone()]),
         ..Default::default()
     };
 
@@ -628,7 +725,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("\nDatabase saved to: {}", db_path.display());
+    println!("\nDatabase saved to: {}", profile.db_path.display());
     println!("\nPricing columns in price_snapshots:");
     println!("  tcg_market_price        - TCGPlayer's algorithmic price (often inaccurate)");
     println!("  lowest_english_price    - Cheapest listing confirmed as English");

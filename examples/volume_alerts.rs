@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tcg_scanner::api::{HistoryRange, SearchTermFilters, SkuPriceHistory};
@@ -7,6 +9,49 @@ const PAGE_SIZE: u32 = 50;
 const REQUEST_DELAY_MS: u64 = 350;
 const MAX_RETRIES: u32 = 3;
 const RETRY_BACKOFF_MS: u64 = 5000;
+
+/// A collection profile loaded from profiles.toml.
+#[derive(Debug)]
+struct Profile {
+    name: String,
+    product_line: String,
+    set_name: String,
+    product_type: String,
+}
+
+fn load_profile(profile_name: &str) -> Profile {
+    let config_path = PathBuf::from("profiles.toml");
+    let content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", config_path.display(), e);
+        std::process::exit(1);
+    });
+    let table: HashMap<String, toml::Value> = toml::from_str(&content).unwrap_or_else(|e| {
+        eprintln!("Failed to parse {}: {}", config_path.display(), e);
+        std::process::exit(1);
+    });
+    let profile_value = table.get(profile_name).unwrap_or_else(|| {
+        let available: Vec<&String> = table.keys().collect();
+        eprintln!("Profile '{}' not found. Available: {}", profile_name,
+            available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        std::process::exit(1);
+    });
+    let t = profile_value.as_table().unwrap_or_else(|| {
+        eprintln!("Profile '{}' is not a valid table", profile_name);
+        std::process::exit(1);
+    });
+    let get_str = |key: &str| -> String {
+        t.get(key).and_then(|v| v.as_str()).unwrap_or_else(|| {
+            eprintln!("Profile '{}' missing field '{}'", profile_name, key);
+            std::process::exit(1);
+        }).to_string()
+    };
+    Profile {
+        name: profile_name.to_string(),
+        product_line: get_str("product_line"),
+        set_name: get_str("set_name"),
+        product_type: get_str("product_type"),
+    }
+}
 
 /// A detected volume spike.
 struct VolumeAlert {
@@ -104,10 +149,18 @@ where
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Parse args
+    // Parse args: <profile> [threshold] [range]
     let args: Vec<String> = std::env::args().collect();
-    let threshold: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-    let range = match args.get(2).map(|s| s.as_str()) {
+    let profile_name = args.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+        eprintln!("Usage: cargo run --example volume_alerts -- <profile> [threshold] [range]");
+        eprintln!("  threshold: spike multiplier (default: 2.0)");
+        eprintln!("  range: month, quarter/3m, semi/6m, annual/1y (default: month)");
+        std::process::exit(1);
+    });
+
+    let profile = load_profile(profile_name);
+    let threshold: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    let range = match args.get(3).map(|s| s.as_str()) {
         Some("quarter") | Some("3m") => HistoryRange::Quarter,
         Some("semi") | Some("6m") => HistoryRange::SemiAnnual,
         Some("annual") | Some("1y") => HistoryRange::Annual,
@@ -115,6 +168,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("=== TCG Volume Spike Detector ===");
+    println!("Profile: {} ({} / {})", profile.name, profile.product_line, profile.set_name);
     println!("Threshold: {:.1}x average daily volume", threshold);
     println!(
         "Range: {} (for computing daily average)",
@@ -129,13 +183,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let client = TcgClient::new()?;
 
     // --- Discover all cards ---
-    println!("\nDiscovering cards in Spiritforged set...");
+    println!("\nDiscovering cards in {} set...", profile.set_name);
     let filters = SearchTermFilters {
-        product_line_name: Some(vec![
-            "Riftbound: League of Legends Trading Card Game".into(),
-        ]),
-        set_name: Some(vec!["Spiritforged".into()]),
-        product_type_name: Some(vec!["Cards".into()]),
+        product_line_name: Some(vec![profile.product_line.clone()]),
+        set_name: Some(vec![profile.set_name.clone()]),
+        product_type_name: Some(vec![profile.product_type.clone()]),
         ..Default::default()
     };
 
@@ -254,7 +306,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         all_cards.len(),
         errors
     );
-    println!("\nUsage: cargo run --example volume_alerts [threshold] [range]");
+    println!("\nUsage: cargo run --example volume_alerts -- <profile> [threshold] [range]");
+    println!("  profile: name from profiles.toml (e.g. spiritforged, origins)");
     println!("  threshold: spike multiplier (default: 2.0)");
     println!("  range: month, quarter/3m, semi/6m, annual/1y (default: month)");
 

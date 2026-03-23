@@ -1,0 +1,15 @@
+# TCG Scanner collection profiles
+# Usage: cargo run --example collect_prices -- <profile_name>
+#        cargo run --example volume_alerts -- <profile_name> [threshold] [range]
+
+[spiritforged]
+product_line = "Riftbound: League of Legends Trading Card Game"
+set_name = "Spiritforged"
+product_type = "Cards"
+db_path = "spiritforged_prices.db"
+
+[origins]
+product_line = "Riftbound: League of Legends Trading Card Game"
+set_name = "Origins"
+product_type = "Cards"
+db_path = "origins_prices.db"
