@@ -1,23 +1,19 @@
 use tcg_scanner::TcgClient;
 
-#[tokio::main]
-async fn main() -> tcg_scanner::Result<()> {
-    let product_id: u64 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(665644); // Default: Darius - Executioner (Overnumbered)
-
+pub async fn run(product_id: u64) -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Fetching product {}...\n", product_id);
 
     let client = TcgClient::new()?;
-
-    // Fetch all product data
     let product = client.get_product(product_id).await?;
     let details = &product.details;
 
     println!("=== Product Details ===");
     println!("Name: {}", details.product_name);
-    println!("Set: {} ({})", details.set_name, details.set_code.as_deref().unwrap_or("?"));
+    println!(
+        "Set: {} ({})",
+        details.set_name,
+        details.set_code.as_deref().unwrap_or("?")
+    );
     println!("Product Line: {}", details.product_line_name);
     if let Some(ref rarity) = details.rarity_name {
         println!("Rarity: {}", rarity);
@@ -46,15 +42,31 @@ async fn main() -> tcg_scanner::Result<()> {
     // Attributes
     if let Some(ref attrs) = details.custom_attributes {
         println!("\n=== Attributes ===");
-        if let Some(ref v) = attrs.energy_cost { println!("Energy Cost: {}", v); }
-        if let Some(ref v) = attrs.power_cost { println!("Power Cost: {}", v); }
-        if let Some(ref v) = attrs.might { println!("Might: {}", v); }
+        if let Some(ref v) = attrs.energy_cost {
+            println!("Energy Cost: {}", v);
+        }
+        if let Some(ref v) = attrs.power_cost {
+            println!("Power Cost: {}", v);
+        }
+        if let Some(ref v) = attrs.might {
+            println!("Might: {}", v);
+        }
         let ct = attrs.card_type_list();
-        if !ct.is_empty() { println!("Card Type: {}", ct.join(", ")); }
-        if let Some(ref v) = attrs.tag { println!("Tag: {}", v); }
-        if let Some(ref v) = attrs.domain { println!("Domain: {}", v); }
-        if let Some(ref v) = attrs.artist { println!("Artist: {}", v); }
-        if let Some(ref v) = attrs.flavor_text { println!("Flavor Text: {}", v); }
+        if !ct.is_empty() {
+            println!("Card Type: {}", ct.join(", "));
+        }
+        if let Some(ref v) = attrs.tag {
+            println!("Tag: {}", v);
+        }
+        if let Some(ref v) = attrs.domain {
+            println!("Domain: {}", v);
+        }
+        if let Some(ref v) = attrs.artist {
+            println!("Artist: {}", v);
+        }
+        if let Some(ref v) = attrs.flavor_text {
+            println!("Flavor Text: {}", v);
+        }
     }
 
     // SKUs
@@ -77,8 +89,12 @@ async fn main() -> tcg_scanner::Result<()> {
         println!(
             "  {}: market={} median={}",
             pp.printing_type.as_deref().unwrap_or("?"),
-            pp.market_price.map(|p| format!("${:.2}", p)).unwrap_or_else(|| "N/A".into()),
-            pp.listed_median_price.map(|p| format!("${:.2}", p)).unwrap_or_else(|| "N/A".into()),
+            pp.market_price
+                .map(|p| format!("${:.2}", p))
+                .unwrap_or_else(|| "N/A".into()),
+            pp.listed_median_price
+                .map(|p| format!("${:.2}", p))
+                .unwrap_or_else(|| "N/A".into()),
         );
     }
 
@@ -88,9 +104,15 @@ async fn main() -> tcg_scanner::Result<()> {
         println!(
             "  SKU {}: market={} low={} high={} (count: {})",
             mp.sku_id,
-            mp.market_price.map(|p| format!("${:.2}", p)).unwrap_or_else(|| "N/A".into()),
-            mp.lowest_price.map(|p| format!("${:.2}", p)).unwrap_or_else(|| "N/A".into()),
-            mp.highest_price.map(|p| format!("${:.2}", p)).unwrap_or_else(|| "N/A".into()),
+            mp.market_price
+                .map(|p| format!("${:.2}", p))
+                .unwrap_or_else(|| "N/A".into()),
+            mp.lowest_price
+                .map(|p| format!("${:.2}", p))
+                .unwrap_or_else(|| "N/A".into()),
+            mp.highest_price
+                .map(|p| format!("${:.2}", p))
+                .unwrap_or_else(|| "N/A".into()),
             mp.price_count.unwrap_or(0),
         );
     }
@@ -107,7 +129,10 @@ async fn main() -> tcg_scanner::Result<()> {
             "  {}. {} ({}) - {} {} ${:.2} {} (qty: {})",
             i + 1,
             listing.seller_name,
-            listing.seller_rating.map(|r| format!("{:.1}%", r)).unwrap_or("N/A".into()),
+            listing
+                .seller_rating
+                .map(|r| format!("{:.1}%", r))
+                .unwrap_or("N/A".into()),
             listing.condition,
             listing.printing,
             listing.price,
@@ -123,7 +148,11 @@ async fn main() -> tcg_scanner::Result<()> {
             for sale in &sales {
                 println!(
                     "  {} - {} {} ${:.2} (qty: {})",
-                    sale.order_date, sale.condition, sale.variant, sale.purchase_price, sale.quantity,
+                    sale.order_date,
+                    sale.condition,
+                    sale.variant,
+                    sale.purchase_price,
+                    sale.quantity,
                 );
             }
         }
