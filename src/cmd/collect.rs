@@ -43,7 +43,7 @@ pub async fn run(profile_name: &str) -> std::result::Result<(), Box<dyn std::err
 
     let conn = Connection::open(&profile.db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-    init_db(&conn);
+    super::common::init_db(&conn);
 
     let client = TcgClient::new()?;
     let now = Utc::now().to_rfc3339();
@@ -313,83 +313,6 @@ pub async fn run(profile_name: &str) -> std::result::Result<(), Box<dyn std::err
 }
 
 // --- Helper functions ---
-
-fn init_db(conn: &Connection) {
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS cards (
-            product_id      INTEGER PRIMARY KEY,
-            product_name    TEXT NOT NULL,
-            clean_name      TEXT,
-            set_name        TEXT,
-            product_line    TEXT,
-            rarity          TEXT,
-            card_number     TEXT,
-            card_type       TEXT,
-            domain          TEXT,
-            energy_cost     TEXT,
-            power_cost      TEXT,
-            might           TEXT,
-            tag             TEXT,
-            foil_only       INTEGER,
-            normal_only     INTEGER,
-            updated_at      TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS price_snapshots (
-            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id                  INTEGER NOT NULL,
-            captured_at                 TEXT NOT NULL,
-            tcg_market_price            REAL,
-            tcg_lowest_price            REAL,
-            tcg_median_price            REAL,
-            tcg_lowest_with_shipping    REAL,
-            total_listings              INTEGER,
-            lowest_english_price        REAL,
-            lowest_english_with_ship    REAL,
-            lowest_english_seller       TEXT,
-            avg_2day_sale_price         REAL,
-            sales_2day_count            INTEGER,
-            FOREIGN KEY (product_id) REFERENCES cards(product_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_snapshots_product_time
-            ON price_snapshots(product_id, captured_at);
-
-        CREATE TABLE IF NOT EXISTS price_points (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id          INTEGER NOT NULL,
-            captured_at         TEXT NOT NULL,
-            printing_type       TEXT,
-            market_price        REAL,
-            buylist_price       REAL,
-            listed_median       REAL,
-            FOREIGN KEY (product_id) REFERENCES cards(product_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_pricepoints_product_time
-            ON price_points(product_id, captured_at);
-
-        CREATE TABLE IF NOT EXISTS sales (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id      INTEGER NOT NULL,
-            order_date      TEXT NOT NULL,
-            purchase_price  REAL NOT NULL,
-            shipping_price  REAL,
-            condition       TEXT,
-            variant         TEXT,
-            language        TEXT,
-            quantity        INTEGER,
-            listing_type    TEXT,
-            UNIQUE(product_id, order_date, purchase_price, condition, variant, quantity),
-            FOREIGN KEY (product_id) REFERENCES cards(product_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_sales_product_date
-            ON sales(product_id, order_date);
-        CREATE INDEX IF NOT EXISTS idx_sales_date
-            ON sales(order_date);
-        ",
-    )
-    .expect("Failed to initialize database schema");
-}
 
 fn is_non_english_listing(listing: &Listing) -> bool {
     if let Some(ref cd) = listing.custom_data {

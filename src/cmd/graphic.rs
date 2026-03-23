@@ -17,46 +17,30 @@ const BG: Rgba<u8> = Rgba([18, 18, 30, 255]);
 const CARD_BG: Rgba<u8> = Rgba([30, 30, 48, 255]);
 const ACCENT: Rgba<u8> = Rgba([99, 102, 241, 255]);
 const TEXT_PRIMARY: Rgba<u8> = Rgba([240, 240, 245, 255]);
-const QTY_BG: Rgba<u8> = Rgba([99, 102, 241, 230]);
+const TEXT_SECONDARY: Rgba<u8> = Rgba([160, 160, 180, 255]);
+const BAR_COLORS: [Rgba<u8>; 5] = [
+    Rgba([99, 102, 241, 255]),  // #1 indigo
+    Rgba([79, 140, 255, 255]),  // #2 blue
+    Rgba([56, 178, 226, 255]), // #3 cyan
+    Rgba([45, 190, 180, 255]), // #4 teal
+    Rgba([60, 200, 150, 255]), // #5 green
+];
 
 // Fonts embedded at compile time
 const FONT_BOLD: &[u8] = include_bytes!("../../assets/Inter-Bold.ttf");
-#[allow(dead_code)]
 const FONT_REGULAR: &[u8] = include_bytes!("../../assets/Inter-Regular.ttf");
 
 // TCGPlayer CDN image URL pattern
-const CDN_BASE: &str =
-    "https://6d4be195623157e28848-7697ece4918e0a73861de0eb37d08968.ssl.cf1.rackcdn.com";
+const CDN_BASE: &str = "https://product-images.tcgplayer.com/fit-in";
 
-async fn download_card_image(
-    client: &reqwest::Client,
-    product_id: u64,
-    high_res: bool,
-) -> Option<DynamicImage> {
-    let suffix = if high_res { "_in_1000x1000" } else { "_200w" };
-    let url = format!("{}/{}{}.jpg", CDN_BASE, product_id, suffix);
-
+async fn download_card_image(client: &reqwest::Client, product_id: u64) -> Option<DynamicImage> {
+    let url = format!("{}/200x200/{}.jpg", CDN_BASE, product_id);
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let bytes = resp.bytes().await.ok()?;
     image::load_from_memory(&bytes).ok()
-}
-
-/// Draw a gradient overlay on the bottom portion of a region for text readability.
-fn draw_bottom_gradient(canvas: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32) {
-    let gradient_h = h / 3;
-    let start_y = y + h - gradient_h;
-    for row in 0..gradient_h {
-        let alpha = (row as f32 / gradient_h as f32 * 220.0) as u8;
-        let color = Rgba([18, 18, 30, alpha]);
-        draw_filled_rect_mut(
-            canvas,
-            Rect::at(x as i32, (start_y + row) as i32).of_size(w, 1),
-            color,
-        );
-    }
 }
 
 /// Resize and crop an image to fill a target area (cover mode).
@@ -82,13 +66,21 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Generate a polished dark-themed graphic featuring card art for the top sellers.
+/// Generate a polished dark-themed graphic with card art thumbnails and bar chart.
 ///
 /// Layout (1200x675):
-/// - Title bar at top
-/// - Hero card (rank #1) on the left, large
-/// - 4 smaller cards in a 2x2 grid on the right
-/// - Each card shows: art image, name overlay, copy count badge
+/// ```text
+/// +--------------------------------------------------+
+/// |  Title                                            |
+/// |==================================================|
+/// |  #1  [thumb]  Card Name                           |
+/// |               ██████████████████████████  34      |
+/// |                                                   |
+/// |  #2  [thumb]  Card Name                           |
+/// |               ████████████████████████    33      |
+/// |  ...                                              |
+/// +--------------------------------------------------+
+/// ```
 pub async fn generate_graphic(
     cards: &[CardEntry],
     title: &str,
@@ -99,6 +91,7 @@ pub async fn generate_graphic(
     }
 
     let font_bold = FontRef::try_from_slice(FONT_BOLD)?;
+    let font_regular = FontRef::try_from_slice(FONT_REGULAR)?;
 
     let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
 
@@ -111,9 +104,17 @@ pub async fn generate_graphic(
     for (i, card) in top.iter().enumerate() {
         let client = client.clone();
         let pid = card.product_id;
+        let fallback_pid = card.fallback_product_id;
         futures.push(tokio::spawn(async move {
-            let high_res = i == 0; // Hero card gets high-res
-            (i, download_card_image(&client, pid, high_res).await)
+            let img = download_card_image(&client, pid).await;
+            if img.is_some() {
+                return (i, img);
+            }
+            // Try fallback (base card) if variant image not found
+            if let Some(fb_pid) = fallback_pid {
+                return (i, download_card_image(&client, fb_pid).await);
+            }
+            (i, None)
         }));
     }
     images.resize_with(top.len(), || None);
@@ -124,13 +125,11 @@ pub async fn generate_graphic(
     }
 
     // === Title bar ===
-    let title_y = 12u32;
     draw_filled_rect_mut(
         &mut canvas,
         Rect::at(0, 0).of_size(WIDTH, 52),
         Rgba([25, 25, 42, 255]),
     );
-    // Accent line under title
     draw_filled_rect_mut(
         &mut canvas,
         Rect::at(0, 52).of_size(WIDTH, 3),
@@ -139,170 +138,132 @@ pub async fn generate_graphic(
     draw_text_mut(
         &mut canvas,
         TEXT_PRIMARY,
-        20,
-        title_y as i32,
+        24,
+        12,
         PxScale::from(28.0),
         &font_bold,
-        &truncate(title, 60),
+        &truncate(title, 55),
     );
 
-    // === Layout constants ===
-    let content_top = 68u32;
-    let content_h = HEIGHT - content_top - 12;
-    let padding = 12u32;
+    // === Bar chart layout ===
+    let content_top = 70u32;
+    let content_bottom = HEIGHT - 16;
+    let content_h = content_bottom - content_top;
+    let count = top.len() as u32;
+    let row_h = content_h / count;
+    let padding = 16u32;
 
-    // Hero card area (left side)
-    let hero_w = 460u32;
-    let hero_h = content_h;
-    let hero_x = padding;
-    let hero_y = content_top;
+    let thumb_size = (row_h - 16).min(100); // thumbnail square, max 100px
+    let thumb_x = padding + 44; // after rank label
+    let bar_x = thumb_x + thumb_size + 16; // bars start after thumbnail
+    let bar_max_w = WIDTH - bar_x - 100; // leave room for count label
 
-    // Small cards area (right side, 2x2 grid)
-    let grid_x = hero_x + hero_w + padding;
-    let grid_w = WIDTH - grid_x - padding;
-    let card_w = (grid_w - padding) / 2;
-    let card_h = (hero_h - padding) / 2;
+    let max_qty = top.iter().map(|c| c.total_qty).max().unwrap_or(1);
 
-    // === Draw hero card (rank #1) ===
-    draw_filled_rect_mut(
-        &mut canvas,
-        Rect::at(hero_x as i32, hero_y as i32).of_size(hero_w, hero_h),
-        CARD_BG,
-    );
-    if let Some(ref img) = images[0] {
-        let fitted = resize_cover(img, hero_w, hero_h);
-        image::imageops::overlay(&mut canvas, &fitted, hero_x as i64, hero_y as i64);
-    }
-    draw_bottom_gradient(&mut canvas, hero_x, hero_y, hero_w, hero_h);
+    for (i, card) in top.iter().enumerate() {
+        let row_y = content_top + (i as u32) * row_h;
+        let center_y = row_y + row_h / 2;
 
-    // Hero card name
-    let hero_name = truncate(&top[0].product_name, 30);
-    draw_text_mut(
-        &mut canvas,
-        TEXT_PRIMARY,
-        (hero_x + 12) as i32,
-        (hero_y + hero_h - 62) as i32,
-        PxScale::from(24.0),
-        &font_bold,
-        &hero_name,
-    );
-
-    // Hero card qty badge
-    let qty_text = format!("{} copies sold", top[0].total_qty);
-    let badge_w = qty_text.len() as u32 * 11 + 20;
-    draw_filled_rect_mut(
-        &mut canvas,
-        Rect::at((hero_x + 12) as i32, (hero_y + hero_h - 34) as i32).of_size(badge_w, 26),
-        QTY_BG,
-    );
-    draw_text_mut(
-        &mut canvas,
-        TEXT_PRIMARY,
-        (hero_x + 22) as i32,
-        (hero_y + hero_h - 31) as i32,
-        PxScale::from(18.0),
-        &font_bold,
-        &qty_text,
-    );
-
-    // === Draw secondary cards (2x2 grid) ===
-    let positions = [
-        (grid_x, content_top),
-        (grid_x + card_w + padding, content_top),
-        (grid_x, content_top + card_h + padding),
-        (grid_x + card_w + padding, content_top + card_h + padding),
-    ];
-
-    for (i, &(cx, cy)) in positions.iter().enumerate() {
-        let card_idx = i + 1;
-        if card_idx >= top.len() {
-            break;
+        // Row background (subtle alternating)
+        if i % 2 == 0 {
+            draw_filled_rect_mut(
+                &mut canvas,
+                Rect::at(0, row_y as i32).of_size(WIDTH, row_h),
+                Rgba([22, 22, 36, 255]),
+            );
         }
 
-        // Card background
-        draw_filled_rect_mut(
+        // Rank number
+        let rank = format!("#{}", i + 1);
+        let rank_color = if i == 0 { ACCENT } else { TEXT_SECONDARY };
+        draw_text_mut(
             &mut canvas,
-            Rect::at(cx as i32, cy as i32).of_size(card_w, card_h),
-            CARD_BG,
+            rank_color,
+            (padding + 4) as i32,
+            (center_y - 12) as i32,
+            PxScale::from(24.0),
+            &font_bold,
+            &rank,
         );
 
-        // Card image
-        if let Some(ref img) = images[card_idx] {
-            let fitted = resize_cover(img, card_w, card_h);
-            image::imageops::overlay(&mut canvas, &fitted, cx as i64, cy as i64);
+        // Card art thumbnail
+        let thumb_y = center_y - thumb_size / 2;
+        draw_filled_rect_mut(
+            &mut canvas,
+            Rect::at(thumb_x as i32, thumb_y as i32).of_size(thumb_size, thumb_size),
+            CARD_BG,
+        );
+        if let Some(ref img) = images[i] {
+            let fitted = resize_cover(img, thumb_size, thumb_size);
+            image::imageops::overlay(&mut canvas, &fitted, thumb_x as i64, thumb_y as i64);
         }
-
-        draw_bottom_gradient(&mut canvas, cx, cy, card_w, card_h);
+        // Thumbnail border
+        let border_color = BAR_COLORS[i % BAR_COLORS.len()];
+        // Top edge
+        draw_filled_rect_mut(&mut canvas, Rect::at(thumb_x as i32, thumb_y as i32).of_size(thumb_size, 2), border_color);
+        // Bottom edge
+        draw_filled_rect_mut(&mut canvas, Rect::at(thumb_x as i32, (thumb_y + thumb_size - 2) as i32).of_size(thumb_size, 2), border_color);
+        // Left edge
+        draw_filled_rect_mut(&mut canvas, Rect::at(thumb_x as i32, thumb_y as i32).of_size(2, thumb_size), border_color);
+        // Right edge
+        draw_filled_rect_mut(&mut canvas, Rect::at((thumb_x + thumb_size - 2) as i32, thumb_y as i32).of_size(2, thumb_size), border_color);
 
         // Card name
-        let name = truncate(&top[card_idx].product_name, 24);
+        let name = truncate(&card.product_name, 40);
         draw_text_mut(
             &mut canvas,
             TEXT_PRIMARY,
-            (cx + 8) as i32,
-            (cy + card_h - 50) as i32,
-            PxScale::from(16.0),
+            bar_x as i32,
+            (center_y - 28) as i32,
+            PxScale::from(20.0),
             &font_bold,
             &name,
         );
 
-        // Qty badge
-        let qty = format!("{} sold", top[card_idx].total_qty);
-        let badge_w = qty.len() as u32 * 9 + 14;
+        // Horizontal bar
+        let bar_w = if max_qty > 0 {
+            (card.total_qty as f64 / max_qty as f64 * bar_max_w as f64) as u32
+        } else {
+            0
+        };
+        let bar_h = 28u32;
+        let bar_y = center_y;
+
+        let bar_color = BAR_COLORS[i % BAR_COLORS.len()];
         draw_filled_rect_mut(
             &mut canvas,
-            Rect::at((cx + 8) as i32, (cy + card_h - 28) as i32).of_size(badge_w, 22),
-            QTY_BG,
-        );
-        draw_text_mut(
-            &mut canvas,
-            TEXT_PRIMARY,
-            (cx + 15) as i32,
-            (cy + card_h - 26) as i32,
-            PxScale::from(14.0),
-            &font_bold,
-            &qty,
+            Rect::at(bar_x as i32, bar_y as i32).of_size(bar_w.max(4), bar_h),
+            bar_color,
         );
 
-        // Rank indicator
-        let rank = format!("#{}", card_idx + 1);
-        draw_filled_rect_mut(
-            &mut canvas,
-            Rect::at(cx as i32, cy as i32).of_size(32, 26),
-            ACCENT,
-        );
+        // Count label at end of bar
+        let qty_label = format!("{}", card.total_qty);
         draw_text_mut(
             &mut canvas,
             TEXT_PRIMARY,
-            (cx + 6) as i32,
-            (cy + 4) as i32,
-            PxScale::from(16.0),
+            (bar_x + bar_w + 10) as i32,
+            (bar_y + 3) as i32,
+            PxScale::from(20.0),
             &font_bold,
-            &rank,
+            &qty_label,
+        );
+
+        // "copies" suffix
+        draw_text_mut(
+            &mut canvas,
+            TEXT_SECONDARY,
+            (bar_x + bar_w + 10 + qty_label.len() as u32 * 12 + 4) as i32,
+            (bar_y + 5) as i32,
+            PxScale::from(16.0),
+            &font_regular,
+            "copies",
         );
     }
 
-    // Rank indicator for hero card
+    // === Bottom accent bar ===
     draw_filled_rect_mut(
         &mut canvas,
-        Rect::at(hero_x as i32, hero_y as i32).of_size(36, 30),
-        ACCENT,
-    );
-    draw_text_mut(
-        &mut canvas,
-        TEXT_PRIMARY,
-        (hero_x + 8) as i32,
-        (hero_y + 5) as i32,
-        PxScale::from(18.0),
-        &font_bold,
-        "#1",
-    );
-
-    // === Bottom bar with branding ===
-    let bottom_y = HEIGHT - 3;
-    draw_filled_rect_mut(
-        &mut canvas,
-        Rect::at(0, bottom_y as i32).of_size(WIDTH, 3),
+        Rect::at(0, (HEIGHT - 3) as i32).of_size(WIDTH, 3),
         ACCENT,
     );
 

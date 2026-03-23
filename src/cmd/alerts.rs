@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::Connection;
-use tcg_scanner::api::{HistoryRange, SearchTermFilters, SkuPriceHistory};
+use tcg_scanner::api::{DetailedPriceHistory, HistoryRange, SearchResult, SearchTermFilters, SkuPriceHistory};
 use tcg_scanner::TcgClient;
 
-use super::common::{load_profile, retry_with_backoff, Profile};
+use super::common::{init_db, load_profile, retry_with_backoff, Profile};
 
 const PAGE_SIZE: u32 = 50;
 const REQUEST_DELAY_MS: u64 = 350;
@@ -36,6 +36,43 @@ pub(crate) struct CardEntry {
     pub(crate) product_id: u64,
     pub(crate) product_name: String,
     pub(crate) total_qty: u32,
+    /// Fallback product_id for image lookup (e.g. base card for alt art variants).
+    pub(crate) fallback_product_id: Option<u64>,
+}
+
+/// Variant suffixes that indicate an alternate version of a base card.
+const VARIANT_SUFFIXES: &[&str] = &[
+    " (Alternate Art)",
+    " (Overnumbered)",
+    " (Signature)",
+];
+
+/// Strip variant suffix from a card name to get the base card name.
+fn base_card_name(name: &str) -> Option<&str> {
+    for suffix in VARIANT_SUFFIXES {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return Some(stripped);
+        }
+    }
+    None
+}
+
+/// Look up a base card's product_id from any of the provided DB connections.
+fn lookup_base_product_id(conns: &[&Connection], variant_name: &str) -> Option<u64> {
+    let base_name = base_card_name(variant_name)?;
+    for conn in conns {
+        let result: Option<i64> = conn
+            .query_row(
+                "SELECT product_id FROM cards WHERE product_name = ?1 LIMIT 1",
+                [base_name],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(pid) = result {
+            return Some(pid as u64);
+        }
+    }
+    None
 }
 
 /// A row from the SQLite top-purchased query.
@@ -92,6 +129,81 @@ fn detect_spikes(
     }
 
     alerts
+}
+
+/// Upsert card metadata from a search result into the DB.
+fn upsert_card(conn: &Connection, card: &SearchResult, profile: &Profile, now: &str) {
+    conn.execute(
+        "INSERT INTO cards (product_id, product_name, clean_name, set_name, product_line, rarity, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(product_id) DO UPDATE SET
+             product_name = excluded.product_name,
+             clean_name = excluded.clean_name,
+             set_name = excluded.set_name,
+             product_line = excluded.product_line,
+             rarity = excluded.rarity,
+             updated_at = excluded.updated_at",
+        rusqlite::params![
+            card.product_id as i64,
+            card.product_name,
+            card.clean_name,
+            profile.set_name,
+            profile.product_line,
+            card.rarity_name,
+            now,
+        ],
+    )
+    .ok();
+}
+
+/// Insert a price snapshot from search result data.
+fn insert_snapshot_from_search(conn: &Connection, card: &SearchResult, now: &str) {
+    conn.execute(
+        "INSERT INTO price_snapshots (product_id, captured_at, tcg_market_price, tcg_lowest_price, tcg_median_price, tcg_lowest_with_shipping, total_listings)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            card.product_id as i64,
+            now,
+            card.market_price,
+            card.lowest_price,
+            card.median_price,
+            card.lowest_price_with_shipping,
+            card.total_listings,
+        ],
+    )
+    .ok();
+}
+
+/// Insert daily bucket data from price history as synthetic sales records.
+/// This gives us aggregate volume data even without individual sale records.
+fn insert_buckets_as_snapshots(
+    conn: &Connection,
+    product_id: u64,
+    history: &DetailedPriceHistory,
+    now: &str,
+) {
+    for sku in &history.result {
+        for bucket in &sku.buckets {
+            // Insert a price snapshot per bucket day with the market price and volume
+            conn.execute(
+                "INSERT OR IGNORE INTO price_snapshots
+                 (product_id, captured_at, tcg_market_price, tcg_lowest_price, avg_2day_sale_price, sales_2day_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    product_id as i64,
+                    now,
+                    bucket.market_price_f64(),
+                    bucket.low_price(),
+                    bucket.market_price_f64(),
+                    bucket.qty_sold(),
+                ],
+            )
+            .ok();
+            // Only store the most recent bucket as a snapshot — we don't want
+            // to flood the snapshots table with historical data on every run.
+            break;
+        }
+    }
 }
 
 /// Check if a profile's DB has data collected within the freshness window.
@@ -250,6 +362,7 @@ pub async fn run(
     let mut all_sqlite_rows: Vec<TopPurchased> = Vec::new();
     let mut stale_profiles: Vec<String> = Vec::new();
     let mut fresh_sets: Vec<String> = Vec::new();
+    let mut fresh_conns: Vec<Connection> = Vec::new();
 
     for name in profile_names {
         let profile = load_profile(name);
@@ -268,6 +381,7 @@ pub async fn run(
 
             let rows = query_top_purchased(&conn, 48);
             all_sqlite_rows.extend(rows);
+            fresh_conns.push(conn);
         } else {
             println!(
                 "  {} — no fresh data (>{} hours old or missing)",
@@ -276,6 +390,8 @@ pub async fn run(
             stale_profiles.push(name.clone());
         }
     }
+
+    let mut graphic_generated = false;
 
     // Print SQLite-based results for fresh profiles
     if !all_sqlite_rows.is_empty() {
@@ -288,21 +404,29 @@ pub async fn run(
 
         // Build CardEntry list for graphic (top 5 overall by total_qty)
         if chart || post {
+            let conn_refs: Vec<&Connection> = fresh_conns.iter().collect();
             let mut entries: Vec<CardEntry> = all_sqlite_rows
                 .iter()
-                .map(|r| CardEntry {
-                    product_id: r.product_id,
-                    product_name: r.product_name.clone(),
-                    total_qty: r.total_qty,
+                .map(|r| {
+                    let fallback = lookup_base_product_id(&conn_refs, &r.product_name);
+                    CardEntry {
+                        product_id: r.product_id,
+                        product_name: r.product_name.clone(),
+                        total_qty: r.total_qty,
+                        fallback_product_id: fallback,
+                    }
                 })
                 .collect();
             entries.sort_by(|a, b| b.total_qty.cmp(&a.total_qty));
             entries.truncate(5);
 
-            let title = format!("Top Sellers — {}", fresh_sets.join(", "));
+            let title = "Riftbound Top Sellers".to_string();
             let path = std::path::PathBuf::from(chart_output);
             match super::graphic::generate_graphic(&entries, &title, &path).await {
-                Ok(()) => println!("\n  Graphic saved to {}", path.display()),
+                Ok(()) => {
+                    println!("\n  Graphic saved to {}", path.display());
+                    graphic_generated = true;
+                }
                 Err(e) => eprintln!("\n  Failed to generate graphic: {}", e),
             }
 
@@ -337,6 +461,12 @@ pub async fn run(
                 profile.name, profile.product_line, profile.set_name
             );
 
+            // Open/create DB for this profile to persist data we fetch
+            let conn = Connection::open(&profile.db_path)?;
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+            init_db(&conn);
+            let now = Utc::now().to_rfc3339();
+
             let filters = SearchTermFilters {
                 product_line_name: Some(vec![profile.product_line.clone()]),
                 set_name: Some(vec![profile.set_name.clone()]),
@@ -359,6 +489,12 @@ pub async fn run(
             }
             println!("  Found {} cards, scanning...", all_cards.len());
 
+            // Persist card metadata and price snapshots from search results
+            for card in &all_cards {
+                upsert_card(&conn, card, &profile, &now);
+                insert_snapshot_from_search(&conn, card, &now);
+            }
+
             let mut all_alerts: Vec<VolumeAlert> = Vec::new();
             let mut errors = 0u32;
             let mut current_delay = REQUEST_DELAY_MS;
@@ -374,6 +510,9 @@ pub async fn run(
                 .await
                 {
                     Ok(history) => {
+                        // Persist price history data to DB
+                        insert_buckets_as_snapshots(&conn, pid, &history, &now);
+
                         let mut spikes =
                             detect_spikes(pid, card_name, rarity, &history.result, threshold);
                         all_alerts.append(&mut spikes);
@@ -469,15 +608,30 @@ pub async fn run(
                 }
             }
 
-            println!("  Scanned {} cards ({} errors)", all_cards.len(), errors);
+            let saved = all_cards.len() as u32 - errors;
+            println!(
+                "  Scanned {} cards ({} errors), saved {} to {}",
+                all_cards.len(),
+                errors,
+                saved,
+                profile.db_path.display()
+            );
 
-            if (chart || post) && !all_alerts.is_empty() {
+            // Make this conn available for fallback lookups
+            fresh_conns.push(conn);
+
+            if (chart || post) && !all_alerts.is_empty() && !graphic_generated {
+                let conn_refs: Vec<&Connection> = fresh_conns.iter().collect();
                 let mut entries: Vec<CardEntry> = all_alerts
                     .iter()
-                    .map(|a| CardEntry {
-                        product_id: a.product_id,
-                        product_name: a.product_name.clone(),
-                        total_qty: a.today_qty,
+                    .map(|a| {
+                        let fallback = lookup_base_product_id(&conn_refs, &a.product_name);
+                        CardEntry {
+                            product_id: a.product_id,
+                            product_name: a.product_name.clone(),
+                            total_qty: a.today_qty.max(a.yesterday_qty),
+                            fallback_product_id: fallback,
+                        }
                     })
                     .collect();
                 entries.sort_by(|a, b| b.total_qty.cmp(&a.total_qty));
