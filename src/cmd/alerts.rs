@@ -36,8 +36,15 @@ pub(crate) struct CardEntry {
     pub(crate) product_id: u64,
     pub(crate) product_name: String,
     pub(crate) total_qty: u32,
+    pub(crate) rarity: String,
     /// Fallback product_id for image lookup (e.g. base card for alt art variants).
     pub(crate) fallback_product_id: Option<u64>,
+}
+
+/// Card selection for the graphic: top overall + top per rarity.
+pub(crate) struct GraphicCards {
+    pub(crate) top_overall: Vec<CardEntry>,
+    pub(crate) top_by_rarity: Vec<CardEntry>,
 }
 
 /// Variant suffixes that indicate an alternate version of a base card.
@@ -347,6 +354,61 @@ fn print_top_by_rarity(rows: &[TopPurchased], top_n: usize) {
     }
 }
 
+/// Build the card selections for the graphic: top 5 overall + top 1 per rarity.
+fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> GraphicCards {
+    // Top 5 overall by volume
+    let mut sorted: Vec<&TopPurchased> = rows.iter().collect();
+    sorted.sort_by(|a, b| b.total_qty.cmp(&a.total_qty));
+
+    let top_overall: Vec<CardEntry> = sorted
+        .iter()
+        .take(5)
+        .map(|r| {
+            let fallback = lookup_base_product_id(conn_refs, &r.product_name);
+            CardEntry {
+                product_id: r.product_id,
+                product_name: r.product_name.clone(),
+                total_qty: r.total_qty,
+                rarity: r.rarity.clone(),
+                fallback_product_id: fallback,
+            }
+        })
+        .collect();
+
+    // Top 1 per rarity (skip cards already in top_overall)
+    let rarity_order = ["Common", "Uncommon", "Rare", "Epic", "Showcase"];
+    let top_ids: Vec<u64> = top_overall.iter().map(|c| c.product_id).collect();
+
+    let mut by_rarity: HashMap<&str, Vec<&TopPurchased>> = HashMap::new();
+    for row in rows {
+        by_rarity.entry(&row.rarity).or_default().push(row);
+    }
+
+    let mut top_by_rarity: Vec<CardEntry> = Vec::new();
+    for rarity in &rarity_order {
+        if let Some(cards) = by_rarity.get(rarity) {
+            // Find the top card in this rarity that isn't already in top_overall
+            if let Some(best) = cards.iter().max_by_key(|c| c.total_qty) {
+                if !top_ids.contains(&best.product_id) {
+                    let fallback = lookup_base_product_id(conn_refs, &best.product_name);
+                    top_by_rarity.push(CardEntry {
+                        product_id: best.product_id,
+                        product_name: best.product_name.clone(),
+                        total_qty: best.total_qty,
+                        rarity: best.rarity.clone(),
+                        fallback_product_id: fallback,
+                    });
+                }
+            }
+        }
+    }
+
+    GraphicCards {
+        top_overall,
+        top_by_rarity,
+    }
+}
+
 /// Run alerts for multiple profiles, using SQLite when fresh.
 pub async fn run(
     profile_names: &[String],
@@ -402,27 +464,14 @@ pub async fn run(
         println!("Sets: {}", fresh_sets.join(", "));
         print_top_by_rarity(&all_sqlite_rows, TOP_N);
 
-        // Build CardEntry list for graphic (top 5 overall by total_qty)
+        // Build GraphicCards: top 5 overall + top 1 per rarity
         if chart || post {
             let conn_refs: Vec<&Connection> = fresh_conns.iter().collect();
-            let mut entries: Vec<CardEntry> = all_sqlite_rows
-                .iter()
-                .map(|r| {
-                    let fallback = lookup_base_product_id(&conn_refs, &r.product_name);
-                    CardEntry {
-                        product_id: r.product_id,
-                        product_name: r.product_name.clone(),
-                        total_qty: r.total_qty,
-                        fallback_product_id: fallback,
-                    }
-                })
-                .collect();
-            entries.sort_by(|a, b| b.total_qty.cmp(&a.total_qty));
-            entries.truncate(5);
+            let graphic_cards = build_graphic_cards(&all_sqlite_rows, &conn_refs);
 
-            let title = "Riftbound Top Sellers".to_string();
+            let title = "Riftbound Top Sellers (48h)".to_string();
             let path = std::path::PathBuf::from(chart_output);
-            match super::graphic::generate_graphic(&entries, &title, &path).await {
+            match super::graphic::generate_graphic(&graphic_cards, &title, &path).await {
                 Ok(()) => {
                     println!("\n  Graphic saved to {}", path.display());
                     graphic_generated = true;
@@ -433,7 +482,8 @@ pub async fn run(
             if post && path.exists() {
                 let tweet_text = format!(
                     "Top selling cards (last 48h): {}",
-                    entries
+                    graphic_cards
+                        .top_overall
                         .iter()
                         .map(|e| e.product_name.as_str())
                         .collect::<Vec<_>>()
@@ -622,24 +672,28 @@ pub async fn run(
 
             if (chart || post) && !all_alerts.is_empty() && !graphic_generated {
                 let conn_refs: Vec<&Connection> = fresh_conns.iter().collect();
-                let mut entries: Vec<CardEntry> = all_alerts
+
+                // Convert alerts to TopPurchased-like entries for build_graphic_cards
+                let alert_rows: Vec<TopPurchased> = all_alerts
                     .iter()
-                    .map(|a| {
-                        let fallback = lookup_base_product_id(&conn_refs, &a.product_name);
-                        CardEntry {
-                            product_id: a.product_id,
-                            product_name: a.product_name.clone(),
-                            total_qty: a.today_qty.max(a.yesterday_qty),
-                            fallback_product_id: fallback,
-                        }
+                    .map(|a| TopPurchased {
+                        product_id: a.product_id,
+                        product_name: a.product_name.clone(),
+                        set_name: String::new(),
+                        rarity: a.rarity.clone(),
+                        total_qty: a.today_qty.max(a.yesterday_qty),
+                        txn_count: 0,
+                        avg_price: 0.0,
+                        low_price: a.today_low,
+                        high_price: a.today_high,
                     })
                     .collect();
-                entries.sort_by(|a, b| b.total_qty.cmp(&a.total_qty));
-                entries.truncate(5);
+
+                let graphic_cards = build_graphic_cards(&alert_rows, &conn_refs);
 
                 let title = format!("Volume Spikes — {}", profile.set_name);
                 let path = std::path::PathBuf::from(chart_output);
-                match super::graphic::generate_graphic(&entries, &title, &path).await {
+                match super::graphic::generate_graphic(&graphic_cards, &title, &path).await {
                     Ok(()) => println!("\n  Graphic saved to {}", path.display()),
                     Err(e) => eprintln!("\n  Failed to generate graphic: {}", e),
                 }
@@ -648,7 +702,8 @@ pub async fn run(
                     let tweet_text = format!(
                         "Volume spike alert for {}: {}",
                         profile.set_name,
-                        entries
+                        graphic_cards
+                            .top_overall
                             .iter()
                             .map(|e| e.product_name.as_str())
                             .collect::<Vec<_>>()
