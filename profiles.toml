@@ -1,6 +1,6 @@
 # TCG Scanner collection profiles
-# Usage: cargo run --example collect_prices -- <profile_name>
-#        cargo run --example volume_alerts -- <profile_name> [threshold] [range]
+# Usage: tcg-scanner collect <profile_name>
+#        tcg-scanner alerts <profile_name> [-t threshold] [-r range]
 
 [spiritforged]
 product_line = "Riftbound: League of Legends Trading Card Game"
