@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::error::Result;
+use crate::error::{Result, TcgError};
 use crate::models::{LatestSalesApiResponse, Sale};
 
 #[derive(Debug, Serialize)]
@@ -52,6 +52,14 @@ pub async fn fetch_latest_sales(
         .json(&body)
         .send()
         .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(TcgError::Parse(format!(
+            "Latest sales API returned HTTP {}",
+            status
+        )));
+    }
 
     let api_response: LatestSalesApiResponse = response.json().await?;
     Ok(api_response.data.into_iter().map(Sale::from).collect())

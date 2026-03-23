@@ -107,4 +107,23 @@ impl TcgClient {
         api::search_products(&self.client, query, from, size).await
     }
 
+    /// Search for products with term filters (set, product line, rarity, etc.).
+    pub async fn search_filtered(
+        &self,
+        query: &str,
+        from: u32,
+        size: u32,
+        filters: &api::SearchTermFilters,
+    ) -> Result<(Vec<api::SearchResult>, u32)> {
+        api::search_products_filtered(&self.client, query, from, size, Some(filters)).await
+    }
+
+    /// Fetch detailed price history (per-SKU daily buckets).
+    pub async fn get_detailed_price_history(
+        &self,
+        product_id: u64,
+        range: api::HistoryRange,
+    ) -> Result<api::DetailedPriceHistory> {
+        api::fetch_detailed_price_history(&self.client, product_id, range).await
+    }
 }

@@ -1,7 +1,24 @@
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
+use serde::{Deserialize, Deserializer, Serialize};
 use crate::error::Result;
+
+fn deserialize_number_as_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: f64 = Deserialize::deserialize(deserializer)?;
+    Ok(v as u64)
+}
+
+fn deserialize_option_number_as_u32<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Option<f64> = Deserialize::deserialize(deserializer)?;
+    Ok(v.map(|n| n as u32))
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +91,7 @@ struct SearchContext {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
+    #[serde(deserialize_with = "deserialize_number_as_u64")]
     pub product_id: u64,
     pub product_name: String,
     pub clean_name: Option<String>,
@@ -81,18 +99,58 @@ pub struct SearchResult {
     pub product_line_name: Option<String>,
     pub rarity_name: Option<String>,
     pub market_price: Option<f64>,
+    pub median_price: Option<f64>,
     pub lowest_price: Option<f64>,
-    pub image_count: Option<u32>,
+    pub lowest_price_with_shipping: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_number_as_u32")]
+    pub total_listings: Option<u32>,
     pub foil_only: Option<bool>,
     pub normal_only: Option<bool>,
+    pub sealed: Option<bool>,
+    pub custom_attributes: Option<serde_json::Value>,
 }
 
 /// Response from the search endpoint.
+/// The outer response has a `results` array of inner result groups.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchApiOuterResponse {
+    pub results: Vec<SearchApiInnerResponse>,
+}
+
+/// Inner result group containing the actual search results.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchApiResponse {
-    pub total_results: Option<u32>,
-    pub results: Vec<SearchResult>,
+pub struct SearchApiInnerResponse {
+    pub total_results: Option<f64>,
+    pub results: Vec<serde_json::Value>,
+}
+
+/// Term filters for narrowing search results.
+#[derive(Debug, Clone, Default)]
+pub struct SearchTermFilters {
+    pub product_line_name: Option<Vec<String>>,
+    pub set_name: Option<Vec<String>>,
+    pub product_type_name: Option<Vec<String>>,
+    pub rarity_name: Option<Vec<String>>,
+}
+
+impl SearchTermFilters {
+    fn to_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        if let Some(ref v) = self.product_line_name {
+            map.insert("productLineName".into(), serde_json::json!(v));
+        }
+        if let Some(ref v) = self.set_name {
+            map.insert("setName".into(), serde_json::json!(v));
+        }
+        if let Some(ref v) = self.product_type_name {
+            map.insert("productTypeName".into(), serde_json::json!(v));
+        }
+        if let Some(ref v) = self.rarity_name {
+            map.insert("rarityName".into(), serde_json::json!(v));
+        }
+        serde_json::Value::Object(map)
+    }
 }
 
 /// Search for products by query string.
@@ -102,17 +160,32 @@ pub async fn search_products(
     from: u32,
     size: u32,
 ) -> Result<(Vec<SearchResult>, u32)> {
+    search_products_filtered(client, query, from, size, None).await
+}
+
+/// Search for products with optional term filters.
+pub async fn search_products_filtered(
+    client: &Client,
+    query: &str,
+    from: u32,
+    size: u32,
+    filters: Option<&SearchTermFilters>,
+) -> Result<(Vec<SearchResult>, u32)> {
     let url = format!(
         "https://mp-search-api.tcgplayer.com/v1/search/request?q={}&isList=false",
         urlencoding::encode(query)
     );
+
+    let term_filters = filters
+        .map(|f| f.to_json())
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let body = SearchRequest {
         algorithm: "sales_synonym_v2".into(),
         from,
         size,
         filters: SearchFilters {
-            term: serde_json::json!({}),
+            term: term_filters,
             range: serde_json::json!({}),
             match_: serde_json::json!({}),
         },
@@ -148,7 +221,17 @@ pub async fn search_products(
         .send()
         .await?;
 
-    let api_response: SearchApiResponse = response.json().await?;
-    let total = api_response.total_results.unwrap_or(0);
-    Ok((api_response.results, total))
+    let outer: SearchApiOuterResponse = response.json().await?;
+    let inner = outer.results.into_iter().next().ok_or_else(|| {
+        crate::error::TcgError::Parse("No results in search response".into())
+    })?;
+
+    let total = inner.total_results.unwrap_or(0.0) as u32;
+    let results: Vec<SearchResult> = inner
+        .results
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+
+    Ok((results, total))
 }
