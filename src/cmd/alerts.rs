@@ -35,6 +35,8 @@ pub(crate) struct VolumeAlert {
 pub(crate) struct CardEntry {
     pub(crate) product_id: u64,
     pub(crate) product_name: String,
+    /// Display name for the graphic (may include card number for promos).
+    pub(crate) display_name: String,
     pub(crate) total_qty: u32,
     pub(crate) rarity: String,
     /// Fallback product_id for image lookup (e.g. base card for alt art variants).
@@ -64,19 +66,57 @@ fn base_card_name(name: &str) -> Option<&str> {
     None
 }
 
-/// Look up a base card's product_id from any of the provided DB connections.
-fn lookup_base_product_id(conns: &[&Connection], variant_name: &str) -> Option<u64> {
-    let base_name = base_card_name(variant_name)?;
+/// Look up a fallback product_id for image lookup from any of the provided DB connections.
+///
+/// Tries two strategies:
+/// 1. Strip variant suffixes (e.g. "(Alternate Art)") and look up the base card name
+/// 2. Find a same-named card in a different set (for promos that share names with regular cards)
+fn lookup_fallback_product_id(conns: &[&Connection], product_id: u64, card_name: &str) -> Option<u64> {
+    // Strategy 1: strip variant suffix
+    if let Some(base_name) = base_card_name(card_name) {
+        for conn in conns {
+            let result: Option<i64> = conn
+                .query_row(
+                    "SELECT product_id FROM cards WHERE product_name = ?1 LIMIT 1",
+                    [base_name],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(pid) = result {
+                return Some(pid as u64);
+            }
+        }
+    }
+
+    // Strategy 2: same name, different product_id (promo → regular set)
     for conn in conns {
         let result: Option<i64> = conn
             .query_row(
-                "SELECT product_id FROM cards WHERE product_name = ?1 LIMIT 1",
-                [base_name],
+                "SELECT product_id FROM cards WHERE product_name = ?1 AND product_id != ?2 LIMIT 1",
+                rusqlite::params![card_name, product_id as i64],
                 |row| row.get(0),
             )
             .ok();
         if let Some(pid) = result {
             return Some(pid as u64);
+        }
+    }
+
+    None
+}
+
+/// Look up a card's number from any of the provided DB connections.
+fn lookup_card_number(conns: &[&Connection], product_id: u64) -> Option<String> {
+    for conn in conns {
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT card_number FROM cards WHERE product_id = ?1",
+                [product_id as i64],
+                |row| row.get(0),
+            )
+            .ok()?;
+        if result.is_some() {
+            return result;
         }
     }
     None
@@ -354,6 +394,31 @@ fn print_top_by_rarity(rows: &[TopPurchased], top_n: usize) {
     }
 }
 
+/// Build a CardEntry from a TopPurchased row, with fallback image lookup and promo display name.
+fn make_card_entry(row: &TopPurchased, conn_refs: &[&Connection]) -> CardEntry {
+    let fallback = lookup_fallback_product_id(conn_refs, row.product_id, &row.product_name);
+
+    // For promo cards, include the card number in the display name
+    let display_name = if row.rarity == "Promo" {
+        if let Some(num) = lookup_card_number(conn_refs, row.product_id) {
+            format!("{} ({})", row.product_name, num)
+        } else {
+            row.product_name.clone()
+        }
+    } else {
+        row.product_name.clone()
+    };
+
+    CardEntry {
+        product_id: row.product_id,
+        product_name: row.product_name.clone(),
+        display_name,
+        total_qty: row.total_qty,
+        rarity: row.rarity.clone(),
+        fallback_product_id: fallback,
+    }
+}
+
 /// Build the card selections for the graphic: top 5 overall + top 1 per rarity.
 fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> GraphicCards {
     // Top 5 overall by volume
@@ -363,20 +428,11 @@ fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> Grap
     let top_overall: Vec<CardEntry> = sorted
         .iter()
         .take(5)
-        .map(|r| {
-            let fallback = lookup_base_product_id(conn_refs, &r.product_name);
-            CardEntry {
-                product_id: r.product_id,
-                product_name: r.product_name.clone(),
-                total_qty: r.total_qty,
-                rarity: r.rarity.clone(),
-                fallback_product_id: fallback,
-            }
-        })
+        .map(|r| make_card_entry(r, conn_refs))
         .collect();
 
     // Top 1 per rarity (skip cards already in top_overall)
-    let rarity_order = ["Common", "Uncommon", "Rare", "Epic", "Showcase"];
+    let rarity_order = ["Common", "Uncommon", "Rare", "Epic", "Showcase", "Promo"];
     let top_ids: Vec<u64> = top_overall.iter().map(|c| c.product_id).collect();
 
     let mut by_rarity: HashMap<&str, Vec<&TopPurchased>> = HashMap::new();
@@ -390,14 +446,7 @@ fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> Grap
             // Find the top card in this rarity that isn't already in top_overall
             if let Some(best) = cards.iter().max_by_key(|c| c.total_qty) {
                 if !top_ids.contains(&best.product_id) {
-                    let fallback = lookup_base_product_id(conn_refs, &best.product_name);
-                    top_by_rarity.push(CardEntry {
-                        product_id: best.product_id,
-                        product_name: best.product_name.clone(),
-                        total_qty: best.total_qty,
-                        rarity: best.rarity.clone(),
-                        fallback_product_id: fallback,
-                    });
+                    top_by_rarity.push(make_card_entry(best, conn_refs));
                 }
             }
         }

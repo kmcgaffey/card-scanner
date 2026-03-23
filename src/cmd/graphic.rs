@@ -27,12 +27,13 @@ const BAR_COLORS: [Rgba<u8>; 5] = [
 ];
 
 // Rarity colors for the "Top by Rarity" section
-const RARITY_COLORS: [(&str, Rgba<u8>); 5] = [
+const RARITY_COLORS: [(&str, Rgba<u8>); 6] = [
     ("Common",   Rgba([140, 140, 155, 255])),   // gray
     ("Uncommon",  Rgba([80, 180, 100, 255])),    // green
     ("Rare",      Rgba([70, 130, 230, 255])),    // blue
     ("Epic",      Rgba([180, 80, 220, 255])),    // purple
     ("Showcase",  Rgba([230, 170, 50, 255])),    // gold
+    ("Promo",     Rgba([220, 100, 100, 255])),   // red
 ];
 
 fn rarity_color(rarity: &str) -> Rgba<u8> {
@@ -175,7 +176,7 @@ fn draw_row(
     draw_filled_rect_mut(canvas, Rect::at((thumb_x + thumb_size - 2) as i32, thumb_y as i32).of_size(2, thumb_size), border_color);
 
     // Card name
-    let name = truncate(&card.product_name, 38);
+    let name = truncate(&card.display_name, 38);
     draw_text_mut(
         canvas,
         TEXT_PRIMARY,
@@ -291,6 +292,7 @@ pub async fn generate_graphic(
         .map(|c| CardEntry {
             product_id: c.product_id,
             product_name: c.product_name.clone(),
+            display_name: c.display_name.clone(),
             total_qty: c.total_qty,
             rarity: c.rarity.clone(),
             fallback_product_id: c.fallback_product_id,
@@ -445,7 +447,7 @@ pub async fn generate_graphic(
             draw_filled_rect_mut(&mut canvas, Rect::at((r_thumb_x + t_size - 2) as i32, thumb_y as i32).of_size(2, t_size), rc);
 
             // Card name
-            let name = truncate(&card.product_name, 28);
+            let name = truncate(&card.display_name, 28);
             draw_text_mut(
                 &mut canvas,
                 TEXT_PRIMARY,
