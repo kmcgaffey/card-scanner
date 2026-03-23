@@ -1,6 +1,7 @@
 # TCG Scanner collection profiles
 # Usage: tcg-scanner collect <profile_name>
 #        tcg-scanner alerts <profile_name> [-t threshold] [-r range]
+#        tcg-scanner alerts --all
 
 [spiritforged]
 product_line = "Riftbound: League of Legends Trading Card Game"
@@ -13,3 +14,27 @@ product_line = "Riftbound: League of Legends Trading Card Game"
 set_name = "Origins"
 product_type = "Cards"
 db_path = "origins_prices.db"
+
+[unleashed]
+product_line = "Riftbound: League of Legends Trading Card Game"
+set_name = "Unleashed"
+product_type = "Cards"
+db_path = "unleashed_prices.db"
+
+[proving-grounds]
+product_line = "Riftbound: League of Legends Trading Card Game"
+set_name = "Origins: Proving Grounds"
+product_type = "Cards"
+db_path = "proving_grounds_prices.db"
+
+[op-promos]
+product_line = "Riftbound: League of Legends Trading Card Game"
+set_name = "Riftbound Organized Play Promotional Cards"
+product_type = "Cards"
+db_path = "op_promos_prices.db"
+
+[promos]
+product_line = "Riftbound: League of Legends Trading Card Game"
+set_name = "Riftbound Promotional Cards"
+product_type = "Cards"
+db_path = "promos_prices.db"

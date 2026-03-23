@@ -16,6 +16,9 @@ pub enum TcgError {
 
     #[error("Product not found: {0}")]
     NotFound(u64),
+
+    #[error("Rate limited (HTTP {0})")]
+    RateLimited(u16),
 }
 
 pub type Result<T> = std::result::Result<T, TcgError>;

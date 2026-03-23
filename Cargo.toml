@@ -14,3 +14,11 @@ urlencoding = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
+image = "0.25"
+imageproc = "0.25"
+ab_glyph = "0.2"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+dotenvy = "0.15"

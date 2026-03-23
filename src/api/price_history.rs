@@ -1,7 +1,17 @@
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Result, TcgError};
+
+/// Deserialize a JSON `null` as an empty Vec (serde `default` only handles missing fields).
+fn deserialize_null_as_empty<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let opt: Option<Vec<T>> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
 
 /// Time range for price history queries.
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +37,8 @@ impl HistoryRange {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PriceHistory {
     pub count: u32,
+    /// Null when the product has no sales history (e.g. pre-release cards).
+    #[serde(default, deserialize_with = "deserialize_null_as_empty")]
     pub result: Vec<PriceHistoryDay>,
 }
 
@@ -49,6 +61,8 @@ pub struct PriceHistoryVariant {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DetailedPriceHistory {
     pub count: u32,
+    /// Null when the product has no sales history (e.g. pre-release cards).
+    #[serde(default, deserialize_with = "deserialize_null_as_empty")]
     pub result: Vec<SkuPriceHistory>,
 }
 
@@ -135,10 +149,14 @@ pub async fn fetch_price_history(
     let response = client
         .get(&url)
         .header("accept", "application/json")
+        .header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
         .send()
         .await?;
 
     let status = response.status();
+    if status.as_u16() == 403 || status.as_u16() == 429 {
+        return Err(TcgError::RateLimited(status.as_u16()));
+    }
     if !status.is_success() {
         return Err(TcgError::Parse(format!(
             "Price history API returned HTTP {}",
@@ -165,10 +183,14 @@ pub async fn fetch_detailed_price_history(
     let response = client
         .get(&url)
         .header("accept", "application/json")
+        .header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
         .send()
         .await?;
 
     let status = response.status();
+    if status.as_u16() == 403 || status.as_u16() == 429 {
+        return Err(TcgError::RateLimited(status.as_u16()));
+    }
     if !status.is_success() {
         return Err(TcgError::Parse(format!(
             "Detailed price history API returned HTTP {}",

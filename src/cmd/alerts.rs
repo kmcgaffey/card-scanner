@@ -1,27 +1,58 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
+use chrono::Utc;
+use rusqlite::Connection;
 use tcg_scanner::api::{HistoryRange, SearchTermFilters, SkuPriceHistory};
 use tcg_scanner::TcgClient;
 
-use super::common::{load_profile, retry_with_backoff};
+use super::common::{load_profile, retry_with_backoff, Profile};
 
 const PAGE_SIZE: u32 = 50;
 const REQUEST_DELAY_MS: u64 = 350;
 const MAX_RETRIES: u32 = 3;
 const RETRY_BACKOFF_MS: u64 = 5000;
 
-struct VolumeAlert {
+/// How recent the DB data must be to skip the API (in hours).
+const FRESHNESS_HOURS: i64 = 12;
+
+/// Top N cards per rarity to show.
+const TOP_N: usize = 5;
+
+pub(crate) struct VolumeAlert {
+    pub(crate) product_id: u64,
+    pub(crate) product_name: String,
+    pub(crate) rarity: String,
+    pub(crate) avg_daily_qty: f64,
+    pub(crate) today_qty: u32,
+    pub(crate) yesterday_qty: u32,
+    pub(crate) spike_ratio: f64,
+    pub(crate) today_low: f64,
+    pub(crate) today_high: f64,
+}
+
+/// Unified entry for graphic generation from either data source.
+pub(crate) struct CardEntry {
+    pub(crate) product_id: u64,
+    pub(crate) product_name: String,
+    pub(crate) total_qty: u32,
+}
+
+/// A row from the SQLite top-purchased query.
+struct TopPurchased {
+    product_id: u64,
     product_name: String,
+    set_name: String,
     rarity: String,
-    avg_daily_qty: f64,
-    today_qty: u32,
-    yesterday_qty: u32,
-    spike_ratio: f64,
-    today_low: f64,
-    today_high: f64,
+    total_qty: u32,
+    txn_count: u32,
+    avg_price: f64,
+    low_price: f64,
+    high_price: f64,
 }
 
 fn detect_spikes(
+    product_id: u64,
     product_name: &str,
     rarity: &str,
     history: &[SkuPriceHistory],
@@ -47,6 +78,7 @@ fn detect_spikes(
 
         if best_ratio >= threshold && (today_qty >= 3 || yesterday_qty >= 3) {
             alerts.push(VolumeAlert {
+                product_id,
                 product_name: product_name.to_string(),
                 rarity: rarity.to_string(),
                 avg_daily_qty: avg_daily,
@@ -62,157 +94,420 @@ fn detect_spikes(
     alerts
 }
 
+/// Check if a profile's DB has data collected within the freshness window.
+fn db_is_fresh(profile: &Profile) -> Option<(Connection, String)> {
+    if !profile.db_path.exists() {
+        return None;
+    }
+
+    let conn = Connection::open(&profile.db_path).ok()?;
+
+    let latest: Option<String> = conn
+        .query_row(
+            "SELECT MAX(captured_at) FROM price_snapshots",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+
+    let latest = latest?;
+
+    let captured = chrono::DateTime::parse_from_rfc3339(&latest).ok()?;
+    let age = Utc::now().signed_duration_since(captured);
+
+    if age.num_hours() < FRESHNESS_HOURS {
+        Some((conn, latest))
+    } else {
+        None
+    }
+}
+
+/// Query top purchased cards by rarity from SQLite sales data.
+fn query_top_purchased(conn: &Connection, hours: i64) -> Vec<TopPurchased> {
+    let cutoff = (Utc::now() - chrono::Duration::hours(hours)).to_rfc3339();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.product_id, c.product_name, c.set_name, c.rarity,
+                    SUM(s.quantity) as total_qty,
+                    COUNT(*) as txn_count,
+                    ROUND(AVG(s.purchase_price), 2) as avg_price,
+                    ROUND(MIN(s.purchase_price), 2) as low_price,
+                    ROUND(MAX(s.purchase_price), 2) as high_price
+             FROM sales s
+             JOIN cards c ON c.product_id = s.product_id
+             WHERE s.order_date >= ?1
+             GROUP BY s.product_id
+             ORDER BY c.rarity, total_qty DESC",
+        )
+        .expect("Failed to prepare query");
+
+    let rows = stmt
+        .query_map([&cutoff], |row| {
+            Ok(TopPurchased {
+                product_id: row.get::<_, i64>(0)? as u64,
+                product_name: row.get(1)?,
+                set_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                rarity: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                total_qty: row.get(4)?,
+                txn_count: row.get(5)?,
+                avg_price: row.get(6)?,
+                low_price: row.get(7)?,
+                high_price: row.get(8)?,
+            })
+        })
+        .expect("Failed to query sales");
+
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Print top N per rarity from a flat list (already sorted by rarity, total_qty desc).
+fn print_top_by_rarity(rows: &[TopPurchased], top_n: usize) {
+    // Rarity display order
+    let rarity_order = ["Common", "Uncommon", "Rare", "Epic", "Showcase"];
+
+    // Group by rarity
+    let mut by_rarity: HashMap<&str, Vec<&TopPurchased>> = HashMap::new();
+    for row in rows {
+        by_rarity.entry(&row.rarity).or_default().push(row);
+    }
+
+    for rarity in &rarity_order {
+        if let Some(cards) = by_rarity.get(rarity) {
+            println!("\n  {} ({} cards with sales)", rarity, cards.len());
+            println!(
+                "    {:<45} {:>7} {:>5} {:>9} {:>9} {:>9} {}",
+                "Card", "Copies", "Txns", "Avg", "Low", "High", "Set"
+            );
+            println!("    {}", "-".repeat(100));
+
+            for card in cards.iter().take(top_n) {
+                let name = if card.product_name.len() > 44 {
+                    format!("{}...", &card.product_name[..41])
+                } else {
+                    card.product_name.clone()
+                };
+                let set = if card.set_name.len() > 15 {
+                    format!("{}...", &card.set_name[..12])
+                } else {
+                    card.set_name.clone()
+                };
+                println!(
+                    "    {:<45} {:>7} {:>5} {:>9} {:>9} {:>9} {}",
+                    name,
+                    card.total_qty,
+                    card.txn_count,
+                    format!("${:.2}", card.avg_price),
+                    format!("${:.2}", card.low_price),
+                    format!("${:.2}", card.high_price),
+                    set,
+                );
+            }
+        }
+    }
+
+    // Catch any rarities not in our display order
+    for (rarity, cards) in &by_rarity {
+        if !rarity_order.contains(rarity) && !cards.is_empty() {
+            println!("\n  {} ({} cards with sales)", rarity, cards.len());
+            println!(
+                "    {:<45} {:>7} {:>5} {:>9} {:>9} {:>9}",
+                "Card", "Copies", "Txns", "Avg", "Low", "High"
+            );
+            println!("    {}", "-".repeat(90));
+            for card in cards.iter().take(top_n) {
+                let name = if card.product_name.len() > 44 {
+                    format!("{}...", &card.product_name[..41])
+                } else {
+                    card.product_name.clone()
+                };
+                println!(
+                    "    {:<45} {:>7} {:>5} {:>9} {:>9} {:>9}",
+                    name,
+                    card.total_qty,
+                    card.txn_count,
+                    format!("${:.2}", card.avg_price),
+                    format!("${:.2}", card.low_price),
+                    format!("${:.2}", card.high_price),
+                );
+            }
+        }
+    }
+}
+
+/// Run alerts for multiple profiles, using SQLite when fresh.
 pub async fn run(
-    profile_name: &str,
+    profile_names: &[String],
     threshold: f64,
     range: HistoryRange,
+    chart: bool,
+    chart_output: &str,
+    post: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let profile = load_profile(profile_name);
+    println!("=== TCG Volume & Sales Report ===\n");
 
-    println!("=== TCG Volume Spike Detector ===");
-    println!(
-        "Profile: {} ({} / {})",
-        profile.name, profile.product_line, profile.set_name
-    );
-    println!("Threshold: {:.1}x average daily volume", threshold);
-    println!(
-        "Range: {} (for computing daily average)",
-        match range {
-            HistoryRange::Month => "1 month",
-            HistoryRange::Quarter => "3 months",
-            HistoryRange::SemiAnnual => "6 months",
-            HistoryRange::Annual => "1 year",
-        }
-    );
+    // Collect fresh DB results and stale profiles separately
+    let mut all_sqlite_rows: Vec<TopPurchased> = Vec::new();
+    let mut stale_profiles: Vec<String> = Vec::new();
+    let mut fresh_sets: Vec<String> = Vec::new();
 
-    let client = TcgClient::new()?;
+    for name in profile_names {
+        let profile = load_profile(name);
 
-    // Discover all cards
-    println!("\nDiscovering cards in {} set...", profile.set_name);
-    let filters = SearchTermFilters {
-        product_line_name: Some(vec![profile.product_line.clone()]),
-        set_name: Some(vec![profile.set_name.clone()]),
-        product_type_name: Some(vec![profile.product_type.clone()]),
-        ..Default::default()
-    };
-
-    let mut all_cards = Vec::new();
-    let mut from = 0u32;
-    loop {
-        let (results, total) = client.search_filtered("", from, PAGE_SIZE, &filters).await?;
-        let count = results.len() as u32;
-        all_cards.extend(results);
-        from += count;
-        if from >= total || count == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    println!(
-        "Found {} cards. Scanning for volume spikes...\n",
-        all_cards.len()
-    );
-
-    // Scan each card for volume spikes
-    let mut all_alerts: Vec<VolumeAlert> = Vec::new();
-    let mut errors = 0u32;
-
-    for (i, card) in all_cards.iter().enumerate() {
-        let pid = card.product_id;
-        let name = &card.product_name;
-        let rarity = card.rarity_name.as_deref().unwrap_or("?");
-
-        match retry_with_backoff(name, MAX_RETRIES, RETRY_BACKOFF_MS, || {
-            client.get_detailed_price_history(pid, range)
-        })
-        .await
-        {
-            Ok(history) => {
-                let mut spikes = detect_spikes(name, rarity, &history.result, threshold);
-                all_alerts.append(&mut spikes);
-            }
-            Err(e) => {
-                eprintln!("  FAILED: {} ({}): {}", name, pid, e);
-                errors += 1;
-            }
-        }
-
-        if (i + 1) % 50 == 0 {
+        if let Some((conn, captured_at)) = db_is_fresh(&profile) {
+            let age = {
+                let captured = chrono::DateTime::parse_from_rfc3339(&captured_at).unwrap();
+                let dur = Utc::now().signed_duration_since(captured);
+                format!("{}h {}m ago", dur.num_hours(), dur.num_minutes() % 60)
+            };
             println!(
-                "  Scanned {}/{} cards ({} alerts so far)",
-                i + 1,
-                all_cards.len(),
-                all_alerts.len()
+                "  {} — using cached data (collected {})",
+                profile.set_name, age
             );
+            fresh_sets.push(profile.set_name.clone());
+
+            let rows = query_top_purchased(&conn, 48);
+            all_sqlite_rows.extend(rows);
+        } else {
+            println!(
+                "  {} — no fresh data (>{} hours old or missing)",
+                profile.set_name, FRESHNESS_HOURS
+            );
+            stale_profiles.push(name.clone());
         }
-        tokio::time::sleep(Duration::from_millis(REQUEST_DELAY_MS)).await;
     }
 
-    // Sort by spike ratio
-    all_alerts.sort_by(|a, b| {
-        b.spike_ratio
-            .partial_cmp(&a.spike_ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Print SQLite-based results for fresh profiles
+    if !all_sqlite_rows.is_empty() {
+        println!(
+            "\n=== Top {} Most Purchased Cards (last 48h) ===",
+            TOP_N
+        );
+        println!("Sets: {}", fresh_sets.join(", "));
+        print_top_by_rarity(&all_sqlite_rows, TOP_N);
 
-    // Print results
-    println!("\n{}", "=".repeat(60));
-    if all_alerts.is_empty() {
-        println!(
-            "\nNo volume spikes detected above {:.1}x threshold.",
-            threshold
-        );
-    } else {
-        println!(
-            "\n{} VOLUME SPIKE ALERTS (>= {:.1}x avg daily volume)\n",
-            all_alerts.len(),
-            threshold
-        );
-        println!(
-            "  {:<40} {:>8} {:>6} {:>6} {:>7} {:>7} {:>10} {:>10}",
-            "Card", "Rarity", "Today", "Yday", "AvgDay", "Spike", "Low", "High"
-        );
-        println!("  {}", "-".repeat(100));
+        // Build CardEntry list for graphic (top 5 overall by total_qty)
+        if chart || post {
+            let mut entries: Vec<CardEntry> = all_sqlite_rows
+                .iter()
+                .map(|r| CardEntry {
+                    product_id: r.product_id,
+                    product_name: r.product_name.clone(),
+                    total_qty: r.total_qty,
+                })
+                .collect();
+            entries.sort_by(|a, b| b.total_qty.cmp(&a.total_qty));
+            entries.truncate(5);
 
-        for alert in &all_alerts {
-            let spike_marker = if alert.spike_ratio >= 5.0 {
-                "!!"
-            } else if alert.spike_ratio >= 3.0 {
-                "! "
-            } else {
-                "  "
+            let title = format!("Top Sellers — {}", fresh_sets.join(", "));
+            let path = std::path::PathBuf::from(chart_output);
+            match super::graphic::generate_graphic(&entries, &title, &path).await {
+                Ok(()) => println!("\n  Graphic saved to {}", path.display()),
+                Err(e) => eprintln!("\n  Failed to generate graphic: {}", e),
+            }
+
+            if post && path.exists() {
+                let tweet_text = format!(
+                    "Top selling cards (last 48h): {}",
+                    entries
+                        .iter()
+                        .map(|e| e.product_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                match super::x_post::post_graphic(&path, &tweet_text).await {
+                    Ok(url) => println!("  Posted to X: {}", url),
+                    Err(e) => eprintln!("  Failed to post to X: {}", e),
+                }
+            }
+        }
+    }
+
+    // Fall back to API-based spike detection for stale profiles
+    if !stale_profiles.is_empty() {
+        println!("\n=== API-Based Volume Spike Scan (stale profiles) ===");
+        println!("Threshold: {:.1}x average daily volume", threshold);
+
+        let client = TcgClient::new()?;
+
+        for name in &stale_profiles {
+            let profile = load_profile(name);
+            println!(
+                "\nScanning {} ({} / {})...",
+                profile.name, profile.product_line, profile.set_name
+            );
+
+            let filters = SearchTermFilters {
+                product_line_name: Some(vec![profile.product_line.clone()]),
+                set_name: Some(vec![profile.set_name.clone()]),
+                product_type_name: Some(vec![profile.product_type.clone()]),
+                ..Default::default()
             };
 
-            let name = if alert.product_name.len() > 38 {
-                format!("{}...", &alert.product_name[..37])
-            } else {
-                alert.product_name.clone()
-            };
+            let mut all_cards = Vec::new();
+            let mut from = 0u32;
+            loop {
+                let (results, total) =
+                    client.search_filtered("", from, PAGE_SIZE, &filters).await?;
+                let count = results.len() as u32;
+                all_cards.extend(results);
+                from += count;
+                if from >= total || count == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            println!("  Found {} cards, scanning...", all_cards.len());
 
-            println!(
-                "{} {:<40} {:>8} {:>6} {:>6} {:>7.1} {:>6.1}x {:>10} {:>10}",
-                spike_marker,
-                name,
-                alert.rarity,
-                alert.today_qty,
-                alert.yesterday_qty,
-                alert.avg_daily_qty,
-                alert.spike_ratio,
-                if alert.today_low > 0.0 {
-                    format!("${:.2}", alert.today_low)
-                } else {
-                    "N/A".into()
-                },
-                if alert.today_high > 0.0 {
-                    format!("${:.2}", alert.today_high)
-                } else {
-                    "N/A".into()
-                },
-            );
+            let mut all_alerts: Vec<VolumeAlert> = Vec::new();
+            let mut errors = 0u32;
+            let mut current_delay = REQUEST_DELAY_MS;
+
+            for (i, card) in all_cards.iter().enumerate() {
+                let pid = card.product_id;
+                let card_name = &card.product_name;
+                let rarity = card.rarity_name.as_deref().unwrap_or("?");
+
+                match retry_with_backoff(card_name, MAX_RETRIES, RETRY_BACKOFF_MS, || {
+                    client.get_detailed_price_history(pid, range)
+                })
+                .await
+                {
+                    Ok(history) => {
+                        let mut spikes =
+                            detect_spikes(pid, card_name, rarity, &history.result, threshold);
+                        all_alerts.append(&mut spikes);
+                        // Gradually reduce delay back to normal after success
+                        if current_delay > REQUEST_DELAY_MS {
+                            current_delay = (current_delay * 3 / 4).max(REQUEST_DELAY_MS);
+                        }
+                    }
+                    Err(e) => {
+                        // Check if this was a rate limit error
+                        let is_rate_limit = e.contains("Rate limited") || e.contains("HTTP 403") || e.contains("HTTP 429");
+                        if is_rate_limit {
+                            // Back off significantly on rate limits
+                            current_delay = (current_delay * 2).min(5000);
+                            eprintln!(
+                                "  Rate limited on {} ({}), increasing delay to {}ms",
+                                card_name, pid, current_delay
+                            );
+                        } else {
+                            eprintln!("  FAILED: {} ({}): {}", card_name, pid, e);
+                        }
+                        errors += 1;
+                    }
+                }
+
+                if (i + 1) % 50 == 0 {
+                    println!(
+                        "  Scanned {}/{} ({} alerts)",
+                        i + 1,
+                        all_cards.len(),
+                        all_alerts.len()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(current_delay)).await;
+            }
+
+            all_alerts.sort_by(|a, b| {
+                b.spike_ratio
+                    .partial_cmp(&a.spike_ratio)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if all_alerts.is_empty() {
+                println!(
+                    "  No volume spikes above {:.1}x threshold.",
+                    threshold
+                );
+            } else {
+                println!(
+                    "\n  {} ALERTS (>= {:.1}x avg daily volume)\n",
+                    all_alerts.len(),
+                    threshold
+                );
+                println!(
+                    "  {:<40} {:>8} {:>6} {:>6} {:>7} {:>7} {:>10} {:>10}",
+                    "Card", "Rarity", "Today", "Yday", "AvgDay", "Spike", "Low", "High"
+                );
+                println!("  {}", "-".repeat(100));
+
+                for alert in &all_alerts {
+                    let spike_marker = if alert.spike_ratio >= 5.0 {
+                        "!!"
+                    } else if alert.spike_ratio >= 3.0 {
+                        "! "
+                    } else {
+                        "  "
+                    };
+                    let aname = if alert.product_name.len() > 38 {
+                        format!("{}...", &alert.product_name[..37])
+                    } else {
+                        alert.product_name.clone()
+                    };
+                    println!(
+                        "{} {:<40} {:>8} {:>6} {:>6} {:>7.1} {:>6.1}x {:>10} {:>10}",
+                        spike_marker,
+                        aname,
+                        alert.rarity,
+                        alert.today_qty,
+                        alert.yesterday_qty,
+                        alert.avg_daily_qty,
+                        alert.spike_ratio,
+                        if alert.today_low > 0.0 {
+                            format!("${:.2}", alert.today_low)
+                        } else {
+                            "N/A".into()
+                        },
+                        if alert.today_high > 0.0 {
+                            format!("${:.2}", alert.today_high)
+                        } else {
+                            "N/A".into()
+                        },
+                    );
+                }
+            }
+
+            println!("  Scanned {} cards ({} errors)", all_cards.len(), errors);
+
+            if (chart || post) && !all_alerts.is_empty() {
+                let mut entries: Vec<CardEntry> = all_alerts
+                    .iter()
+                    .map(|a| CardEntry {
+                        product_id: a.product_id,
+                        product_name: a.product_name.clone(),
+                        total_qty: a.today_qty,
+                    })
+                    .collect();
+                entries.sort_by(|a, b| b.total_qty.cmp(&a.total_qty));
+                entries.truncate(5);
+
+                let title = format!("Volume Spikes — {}", profile.set_name);
+                let path = std::path::PathBuf::from(chart_output);
+                match super::graphic::generate_graphic(&entries, &title, &path).await {
+                    Ok(()) => println!("\n  Graphic saved to {}", path.display()),
+                    Err(e) => eprintln!("\n  Failed to generate graphic: {}", e),
+                }
+
+                if post && path.exists() {
+                    let tweet_text = format!(
+                        "Volume spike alert for {}: {}",
+                        profile.set_name,
+                        entries
+                            .iter()
+                            .map(|e| e.product_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    match super::x_post::post_graphic(&path, &tweet_text).await {
+                        Ok(url) => println!("  Posted to X: {}", url),
+                        Err(e) => eprintln!("  Failed to post to X: {}", e),
+                    }
+                }
+            }
         }
     }
-
-    println!("\nScanned {} cards ({} errors)", all_cards.len(), errors);
 
     Ok(())
 }
