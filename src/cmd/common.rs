@@ -174,6 +174,24 @@ pub fn init_db(conn: &Connection) {
             ON sales(product_id, order_date);
         CREATE INDEX IF NOT EXISTS idx_sales_date
             ON sales(order_date);
+
+        CREATE TABLE IF NOT EXISTS daily_volume (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id      INTEGER NOT NULL,
+            bucket_date     TEXT NOT NULL,
+            variant         TEXT,
+            condition       TEXT,
+            quantity_sold   INTEGER NOT NULL,
+            market_price    REAL,
+            low_price       REAL,
+            high_price      REAL,
+            UNIQUE(product_id, bucket_date, variant, condition),
+            FOREIGN KEY (product_id) REFERENCES cards(product_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_volume_product_date
+            ON daily_volume(product_id, bucket_date);
+        CREATE INDEX IF NOT EXISTS idx_daily_volume_date
+            ON daily_volume(bucket_date);
         ",
     )
     .expect("Failed to initialize database schema");

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::Connection;
-use tcg_scanner::api::SearchTermFilters;
+use tcg_scanner::api::{HistoryRange, SearchTermFilters};
 use tcg_scanner::{Listing, TcgClient};
 
 use super::common::{load_profile, retry_with_backoff};
@@ -228,7 +228,69 @@ pub async fn run(profile_name: &str) -> std::result::Result<(), Box<dyn std::err
         total_processed, new_sales, sales_errors
     );
 
-    // --- Phase 5: Compute 2-day average sale prices ---
+    // --- Phase 5: Fetch daily volume from price history ---
+    println!("\n=== Phase 5: Fetching daily volume (price history) ===");
+
+    let mut vol_count = 0u32;
+    let mut vol_errors = 0u32;
+
+    for (i, card) in all_cards.iter().enumerate() {
+        let pid = card.product_id;
+        match retry_with_backoff(&card.product_name, MAX_RETRIES, RETRY_BACKOFF_MS, || {
+            client.get_detailed_price_history(pid, HistoryRange::Month)
+        })
+        .await
+        {
+            Ok(history) => {
+                for sku in &history.result {
+                    for bucket in &sku.buckets {
+                        let inserted = conn.execute(
+                            "INSERT OR REPLACE INTO daily_volume
+                             (product_id, bucket_date, variant, condition, quantity_sold, market_price, low_price, high_price)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            rusqlite::params![
+                                pid as i64,
+                                &bucket.bucket_start_date,
+                                &sku.variant,
+                                &sku.condition,
+                                bucket.qty_sold(),
+                                bucket.market_price_f64(),
+                                bucket.low_price(),
+                                bucket.high_price(),
+                            ],
+                        ).unwrap_or(0);
+                        vol_count += inserted as u32;
+                    }
+                }
+            }
+            Err(e) => {
+                // Rate limits and pre-release cards are expected
+                if !e.contains("Rate limited") {
+                    eprintln!(
+                        "  FAILED: volume for {} ({}): {}",
+                        card.product_name, pid, e
+                    );
+                }
+                vol_errors += 1;
+            }
+        }
+
+        if (i + 1) % 50 == 0 {
+            println!(
+                "  Volume: {}/{} cards processed ({} records)",
+                i + 1,
+                all_cards.len(),
+                vol_count
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(REQUEST_DELAY_MS)).await;
+    }
+    println!(
+        "  Stored {} daily volume records ({} errors)",
+        vol_count, vol_errors
+    );
+
+    // --- Phase 6: Compute 2-day average sale prices ---
     println!("\n=== Phase 5: Computing 2-day average sale prices ===");
     compute_2day_averages(&conn, &now);
 
@@ -250,12 +312,14 @@ pub async fn run(profile_name: &str) -> std::result::Result<(), Box<dyn std::err
         conn.query_row("SELECT COUNT(*) FROM price_snapshots", [], |r| r.get(0))?;
     let pp_total: u32 = conn.query_row("SELECT COUNT(*) FROM price_points", [], |r| r.get(0))?;
     let sale_total: u32 = conn.query_row("SELECT COUNT(*) FROM sales", [], |r| r.get(0))?;
+    let vol_total: u32 = conn.query_row("SELECT COUNT(*) FROM daily_volume", [], |r| r.get(0))?;
 
     println!("\n=== Collection Complete ===");
     println!("  Cards in DB:          {}", card_count);
     println!("  Price snapshots:      {}", snapshot_count);
     println!("  Price point records:  {}", pp_total);
     println!("  Total sale records:   {}", sale_total);
+    println!("  Daily volume records: {}", vol_total);
 
     // Show price comparison
     println!("\n=== Price Comparison (top cards by English listing) ===");

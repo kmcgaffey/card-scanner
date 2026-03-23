@@ -221,34 +221,30 @@ fn insert_snapshot_from_search(conn: &Connection, card: &SearchResult, now: &str
     .ok();
 }
 
-/// Insert daily bucket data from price history as synthetic sales records.
-/// This gives us aggregate volume data even without individual sale records.
-fn insert_buckets_as_snapshots(
+/// Insert daily volume data from price history into the daily_volume table.
+fn insert_daily_volume(
     conn: &Connection,
     product_id: u64,
     history: &DetailedPriceHistory,
-    now: &str,
 ) {
     for sku in &history.result {
         for bucket in &sku.buckets {
-            // Insert a price snapshot per bucket day with the market price and volume
             conn.execute(
-                "INSERT OR IGNORE INTO price_snapshots
-                 (product_id, captured_at, tcg_market_price, tcg_lowest_price, avg_2day_sale_price, sales_2day_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR REPLACE INTO daily_volume
+                 (product_id, bucket_date, variant, condition, quantity_sold, market_price, low_price, high_price)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     product_id as i64,
-                    now,
+                    &bucket.bucket_start_date,
+                    &sku.variant,
+                    &sku.condition,
+                    bucket.qty_sold(),
                     bucket.market_price_f64(),
                     bucket.low_price(),
-                    bucket.market_price_f64(),
-                    bucket.qty_sold(),
+                    bucket.high_price(),
                 ],
             )
             .ok();
-            // Only store the most recent bucket as a snapshot — we don't want
-            // to flood the snapshots table with historical data on every run.
-            break;
         }
     }
 }
@@ -281,10 +277,73 @@ fn db_is_fresh(profile: &Profile) -> Option<(Connection, String)> {
     }
 }
 
-/// Query top purchased cards by rarity from SQLite sales data.
+/// Query top purchased cards by rarity from daily volume data.
+/// Falls back to the sales table if daily_volume is empty (older DBs).
 fn query_top_purchased(conn: &Connection, hours: i64) -> Vec<TopPurchased> {
     let cutoff = (Utc::now() - chrono::Duration::hours(hours)).to_rfc3339();
 
+    // Check if daily_volume table exists and has data
+    let has_volume: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='daily_volume'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    if has_volume {
+        let vol_count: u32 = conn
+            .query_row("SELECT COUNT(*) FROM daily_volume", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if vol_count > 0 {
+            return query_top_from_volume(conn, &cutoff);
+        }
+    }
+
+    // Fall back to sales table for older DBs without daily_volume
+    query_top_from_sales(conn, &cutoff)
+}
+
+/// Query top cards using the daily_volume table (accurate aggregate data).
+fn query_top_from_volume(conn: &Connection, cutoff: &str) -> Vec<TopPurchased> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT v.product_id, c.product_name, c.set_name, c.rarity,
+                    SUM(v.quantity_sold) as total_qty,
+                    SUM(v.quantity_sold) as txn_count,
+                    ROUND(AVG(v.market_price), 2) as avg_price,
+                    ROUND(MIN(v.low_price), 2) as low_price,
+                    ROUND(MAX(v.high_price), 2) as high_price
+             FROM daily_volume v
+             JOIN cards c ON c.product_id = v.product_id
+             WHERE v.bucket_date >= ?1
+             GROUP BY v.product_id
+             ORDER BY c.rarity, total_qty DESC",
+        )
+        .expect("Failed to prepare volume query");
+
+    let rows = stmt
+        .query_map([cutoff], |row| {
+            Ok(TopPurchased {
+                product_id: row.get::<_, i64>(0)? as u64,
+                product_name: row.get(1)?,
+                set_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                rarity: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                total_qty: row.get(4)?,
+                txn_count: row.get(5)?,
+                avg_price: row.get(6)?,
+                low_price: row.get(7)?,
+                high_price: row.get(8)?,
+            })
+        })
+        .expect("Failed to query volume");
+
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Fallback: query top cards from individual sales records.
+fn query_top_from_sales(conn: &Connection, cutoff: &str) -> Vec<TopPurchased> {
     let mut stmt = conn
         .prepare(
             "SELECT s.product_id, c.product_name, c.set_name, c.rarity,
@@ -299,10 +358,10 @@ fn query_top_purchased(conn: &Connection, hours: i64) -> Vec<TopPurchased> {
              GROUP BY s.product_id
              ORDER BY c.rarity, total_qty DESC",
         )
-        .expect("Failed to prepare query");
+        .expect("Failed to prepare sales query");
 
     let rows = stmt
-        .query_map([&cutoff], |row| {
+        .query_map([cutoff], |row| {
             Ok(TopPurchased {
                 product_id: row.get::<_, i64>(0)? as u64,
                 product_name: row.get(1)?,
@@ -610,7 +669,7 @@ pub async fn run(
                 {
                     Ok(history) => {
                         // Persist price history data to DB
-                        insert_buckets_as_snapshots(&conn, pid, &history, &now);
+                        insert_daily_volume(&conn, pid, &history);
 
                         let mut spikes =
                             detect_spikes(pid, card_name, rarity, &history.result, threshold);
