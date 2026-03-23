@@ -577,7 +577,9 @@ pub async fn run(
             let conn_refs: Vec<&Connection> = fresh_conns.iter().collect();
             let graphic_cards = build_graphic_cards(&all_sqlite_rows, &conn_refs);
 
-            let title = "Riftbound Top Sellers (48h)".to_string();
+            let end_date = Utc::now().format("%b %d");
+            let start_date = (Utc::now() - chrono::Duration::hours(48)).format("%b %d");
+            let title = format!("Riftbound Top Sellers — {} to {}", start_date, end_date);
             let path = std::path::PathBuf::from(chart_output);
             match super::graphic::generate_graphic(&graphic_cards, &title, &path).await {
                 Ok(()) => {
@@ -799,7 +801,9 @@ pub async fn run(
 
                 let graphic_cards = build_graphic_cards(&alert_rows, &conn_refs);
 
-                let title = format!("Volume Spikes — {}", profile.set_name);
+                let end_date = Utc::now().format("%b %d");
+                let start_date = (Utc::now() - chrono::Duration::hours(48)).format("%b %d");
+                let title = format!("Volume Spikes — {} — {} to {}", profile.set_name, start_date, end_date);
                 let path = std::path::PathBuf::from(chart_output);
                 match super::graphic::generate_graphic(&graphic_cards, &title, &path).await {
                     Ok(()) => println!("\n  Graphic saved to {}", path.display()),
