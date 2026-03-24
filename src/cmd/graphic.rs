@@ -374,7 +374,7 @@ pub async fn generate_graphic(
     let thumb_x = padding + 38;
     let card_w = ((row_h.saturating_sub(8)) as f32 * 0.715) as u32;
     let bar_x = thumb_x + card_w + 12;
-    let bar_max_w = left_w - bar_x - 90;
+    let bar_max_w = ((left_w - bar_x - 90) as f32 * 0.9) as u32;
     let max_qty_overall = cards.top_overall.iter().map(|c| c.total_qty).max().unwrap_or(1);
 
     for (i, card) in cards.top_overall.iter().take(5).enumerate() {
@@ -422,7 +422,7 @@ pub async fn generate_graphic(
         let r_thumb_x = right_x + padding + 2;
         let r_card_w = ((rarity_row_h.saturating_sub(8)) as f32 * 0.715) as u32;
         let r_bar_x = r_thumb_x + r_card_w + 12;
-        let r_bar_max_w = WIDTH - r_bar_x - 90;
+        let r_bar_max_w = ((WIDTH - r_bar_x - 90) as f32 * 0.9) as u32;
         let max_qty_rarity = cards.top_by_rarity.iter().map(|c| c.total_qty).max().unwrap_or(1);
 
         for (i, card) in cards.top_by_rarity.iter().enumerate() {
