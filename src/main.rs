@@ -43,6 +43,10 @@ enum Commands {
         #[arg(long, default_value = "alerts_chart.png")]
         chart_output: String,
 
+        /// Generate two separate images (sellers + rarity) instead of one combined
+        #[arg(long)]
+        split: bool,
+
         /// Post the generated graphic to X (Twitter)
         #[arg(long)]
         post: bool,
@@ -102,6 +106,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             range,
             chart,
             chart_output,
+            split,
             post,
         } => {
             let names = if all {
@@ -120,6 +125,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 parse_range(&range),
                 chart || post, // --post implies --chart
                 &chart_output,
+                split,
                 post,
             )
             .await?;

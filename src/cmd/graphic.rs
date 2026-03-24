@@ -187,17 +187,18 @@ fn draw_row(
         canvas,
         TEXT_PRIMARY,
         bar_x as i32,
-        (center_y - 24) as i32,
-        PxScale::from(18.0),
+        (center_y - 26) as i32,
+        PxScale::from(20.0),
         font_bold,
         &name,
     );
 
     // Price + change (right-justified)
+    let price_font_size = 16.0f32;
     let change_str = card.price_change_pct.map(|pct| format_price_change(pct));
     let price_label = format!("${:.2}", card.avg_price);
-    let change_w = change_str.as_ref().map(|(s, _)| text_width(s, 14.0) + 4).unwrap_or(0);
-    let price_w = text_width(&price_label, 14.0);
+    let change_w = change_str.as_ref().map(|(s, _)| text_width(s, price_font_size) + 4).unwrap_or(0);
+    let price_w = text_width(&price_label, price_font_size);
     let total_price_w = price_w + change_w + 4;
     let price_x = right_edge - total_price_w - padding;
 
@@ -205,8 +206,8 @@ fn draw_row(
         canvas,
         TEXT_SECONDARY,
         price_x as i32,
-        (center_y - 22) as i32,
-        PxScale::from(14.0),
+        (center_y - 24) as i32,
+        PxScale::from(price_font_size),
         font_regular,
         &price_label,
     );
@@ -216,8 +217,8 @@ fn draw_row(
             canvas,
             *color,
             (price_x + price_w + 4) as i32,
-            (center_y - 22) as i32,
-            PxScale::from(14.0),
+            (center_y - 24) as i32,
+            PxScale::from(price_font_size),
             font_bold,
             label,
         );
@@ -451,35 +452,37 @@ pub async fn generate_graphic(
                 image::imageops::overlay(&mut canvas, &fitted, img_x as i64, img_y as i64);
             }
 
-            // Card name (left-aligned)
+            // Rarity label (before card name)
+            let rarity_label = format!("[{}]", card.rarity);
+            draw_text_mut(
+                &mut canvas,
+                rc,
+                r_bar_x as i32,
+                (center_y - 24) as i32,
+                PxScale::from(14.0),
+                &font_bold,
+                &rarity_label,
+            );
+
+            // Card name (after rarity)
+            let name_x = r_bar_x + text_width(&rarity_label, 14.0) + 4;
             let name = truncate(&card.display_name, 20);
             draw_text_mut(
                 &mut canvas,
                 TEXT_PRIMARY,
-                r_bar_x as i32,
-                (center_y - 24) as i32,
-                PxScale::from(16.0),
+                name_x as i32,
+                (center_y - 26) as i32,
+                PxScale::from(18.0),
                 &font_bold,
                 &name,
             );
 
-            // Rarity label after card name
-            let rarity_x = r_bar_x + text_width(&name, 16.0) + 6;
-            draw_text_mut(
-                &mut canvas,
-                rc,
-                rarity_x as i32,
-                (center_y - 22) as i32,
-                PxScale::from(13.0),
-                &font_regular,
-                &card.rarity,
-            );
-
             // Price + change (right-justified)
+            let r_price_font = 15.0f32;
             let r_change_str = card.price_change_pct.map(|pct| format_price_change(pct));
             let r_price_label = format!("${:.2}", card.avg_price);
-            let r_change_w = r_change_str.as_ref().map(|(s, _)| text_width(s, 13.0) + 4).unwrap_or(0);
-            let r_price_w = text_width(&r_price_label, 13.0);
+            let r_change_w = r_change_str.as_ref().map(|(s, _)| text_width(s, r_price_font) + 4).unwrap_or(0);
+            let r_price_w = text_width(&r_price_label, r_price_font);
             let r_total_w = r_price_w + r_change_w + 4;
             let r_price_x = WIDTH - r_total_w - 16;
 
@@ -487,8 +490,8 @@ pub async fn generate_graphic(
                 &mut canvas,
                 TEXT_SECONDARY,
                 r_price_x as i32,
-                (center_y - 22) as i32,
-                PxScale::from(13.0),
+                (center_y - 24) as i32,
+                PxScale::from(r_price_font),
                 &font_regular,
                 &r_price_label,
             );
@@ -498,8 +501,8 @@ pub async fn generate_graphic(
                     &mut canvas,
                     *color,
                     (r_price_x + r_price_w + 4) as i32,
-                    (center_y - 22) as i32,
-                    PxScale::from(13.0),
+                    (center_y - 24) as i32,
+                    PxScale::from(r_price_font),
                     &font_bold,
                     label,
                 );
@@ -542,4 +545,159 @@ pub async fn generate_graphic(
 
     canvas.save(output_path)?;
     Ok(())
+}
+
+/// Helper to draw title bar and bottom accent on a canvas.
+fn draw_chrome(canvas: &mut RgbaImage, font_bold: &FontRef, title: &str, w: u32, h: u32) {
+    draw_filled_rect_mut(canvas, Rect::at(0, 0).of_size(w, 52), Rgba([25, 25, 42, 255]));
+    draw_filled_rect_mut(canvas, Rect::at(0, 52).of_size(w, 3), ACCENT);
+    draw_text_mut(canvas, TEXT_PRIMARY, 24, 12, PxScale::from(28.0), font_bold, &truncate(title, 55));
+    draw_filled_rect_mut(canvas, Rect::at(0, (h - 3) as i32).of_size(w, 3), ACCENT);
+}
+
+/// Generate two separate images: one for top sellers, one for top by rarity.
+/// Each image is full-width (1200x675) for maximum clarity.
+pub async fn generate_split_graphics(
+    cards: &GraphicCards,
+    title: &str,
+    output_base: &Path,
+) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    if cards.top_overall.is_empty() {
+        return Err("No cards to render".into());
+    }
+
+    let font_bold = FontRef::try_from_slice(FONT_BOLD)?;
+    let font_regular = FontRef::try_from_slice(FONT_REGULAR)?;
+    let client = reqwest::Client::new();
+    let padding = 16u32;
+    let content_top = 70u32;
+    let content_bottom = HEIGHT - 16;
+    let content_h = content_bottom - content_top;
+    let section_top = content_top + 26;
+
+    let mut paths = Vec::new();
+
+    // Build output paths from base path
+    let stem = output_base.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = output_base.extension().unwrap_or_default().to_string_lossy();
+    let parent = output_base.parent().unwrap_or(Path::new("."));
+
+    // === Image 1: Top Sellers ===
+    {
+        let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
+        let sellers_title = format!("{} — Top Sellers", title);
+        draw_chrome(&mut canvas, &font_bold, &sellers_title, WIDTH, HEIGHT);
+
+        draw_text_mut(&mut canvas, ACCENT, (padding + 2) as i32, (content_top + 2) as i32,
+            PxScale::from(16.0), &font_bold, "TOP SELLERS BY VOLUME");
+
+        let overall_count = cards.top_overall.len().min(5) as u32;
+        let row_h = (content_h - 26) / overall_count.max(1);
+        let thumb_x = padding + 38;
+        let card_w = ((row_h.saturating_sub(8)) as f32 * 0.715) as u32;
+        let bar_x = thumb_x + card_w + 12;
+        let bar_max_w = ((WIDTH - bar_x - 90) as f32 * 0.9) as u32;
+        let max_qty = cards.top_overall.iter().map(|c| c.total_qty).max().unwrap_or(1);
+
+        // Download images
+        let overall_images = download_images(&client, &cards.top_overall).await;
+
+        for (i, card) in cards.top_overall.iter().take(5).enumerate() {
+            let row_y = section_top + (i as u32) * row_h;
+            draw_row(&mut canvas, &font_bold, &font_regular, card, &overall_images[i],
+                i, row_y, row_h, thumb_x, bar_x, bar_max_w, max_qty, padding, WIDTH);
+        }
+
+        let path = parent.join(format!("{}_sellers.{}", stem, ext));
+        canvas.save(&path)?;
+        paths.push(path);
+    }
+
+    // === Image 2: Top by Rarity ===
+    if !cards.top_by_rarity.is_empty() {
+        let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
+        let rarity_title = format!("{} — Top by Rarity", title);
+        draw_chrome(&mut canvas, &font_bold, &rarity_title, WIDTH, HEIGHT);
+
+        draw_text_mut(&mut canvas, ACCENT, (padding + 2) as i32, (content_top + 2) as i32,
+            PxScale::from(16.0), &font_bold, "TOP SELLER PER RARITY");
+
+        let rarity_count = cards.top_by_rarity.len() as u32;
+        let row_h = (content_h - 26) / rarity_count.max(1);
+        let thumb_x = padding + 2;
+        let card_w = ((row_h.saturating_sub(8)) as f32 * 0.715) as u32;
+        let bar_x = thumb_x + card_w + 12;
+        let bar_max_w = ((WIDTH - bar_x - 90) as f32 * 0.9) as u32;
+        let max_qty = cards.top_by_rarity.iter().map(|c| c.total_qty).max().unwrap_or(1);
+
+        let rarity_images = download_images(&client, &cards.top_by_rarity).await;
+
+        for (i, card) in cards.top_by_rarity.iter().enumerate() {
+            let row_y = section_top + (i as u32) * row_h;
+            let rc = rarity_color(&card.rarity);
+            let center_y = row_y + row_h / 2;
+
+            // Alternating row background
+            if i % 2 == 0 {
+                draw_filled_rect_mut(&mut canvas,
+                    Rect::at(0, row_y as i32).of_size(WIDTH, row_h), Rgba([22, 22, 36, 255]));
+            }
+
+            // Full card image
+            let card_h = row_h.saturating_sub(8);
+            let card_y = row_y + 4;
+            if let Some(ref img) = rarity_images[i] {
+                let fitted = resize_fit(img, card_w, card_h);
+                let img_x = thumb_x + (card_w.saturating_sub(fitted.width())) / 2;
+                let img_y = card_y + (card_h.saturating_sub(fitted.height())) / 2;
+                image::imageops::overlay(&mut canvas, &fitted, img_x as i64, img_y as i64);
+            }
+
+            // Rarity label before card name
+            let rarity_label = format!("[{}]", card.rarity);
+            draw_text_mut(&mut canvas, rc, bar_x as i32, (center_y - 24) as i32,
+                PxScale::from(16.0), &font_bold, &rarity_label);
+
+            let name_x = bar_x + text_width(&rarity_label, 16.0) + 4;
+            let name = truncate(&card.display_name, 24);
+            draw_text_mut(&mut canvas, TEXT_PRIMARY, name_x as i32, (center_y - 26) as i32,
+                PxScale::from(20.0), &font_bold, &name);
+
+            // Price + change (right-justified)
+            let r_price_font = 16.0f32;
+            let r_change_str = card.price_change_pct.map(|pct| format_price_change(pct));
+            let r_price_label = format!("${:.2}", card.avg_price);
+            let r_change_w = r_change_str.as_ref().map(|(s, _)| text_width(s, r_price_font) + 4).unwrap_or(0);
+            let r_price_w = text_width(&r_price_label, r_price_font);
+            let r_total_w = r_price_w + r_change_w + 4;
+            let r_price_x = WIDTH - r_total_w - 16;
+
+            draw_text_mut(&mut canvas, TEXT_SECONDARY, r_price_x as i32, (center_y - 24) as i32,
+                PxScale::from(r_price_font), &font_regular, &r_price_label);
+
+            if let Some((label, color)) = &r_change_str {
+                draw_text_mut(&mut canvas, *color, (r_price_x + r_price_w + 4) as i32,
+                    (center_y - 24) as i32, PxScale::from(r_price_font), &font_bold, label);
+            }
+
+            // Bar (rarity-colored)
+            let bar_w = if max_qty > 0 {
+                (card.total_qty as f64 / max_qty as f64 * bar_max_w as f64) as u32
+            } else { 0 };
+            let bar_h = 22u32;
+            let bar_y = center_y + 2;
+            draw_filled_rect_mut(&mut canvas,
+                Rect::at(bar_x as i32, bar_y as i32).of_size(bar_w.max(4), bar_h), rc);
+
+            let qty_label = format!("{} copies", card.total_qty);
+            draw_text_mut(&mut canvas, TEXT_PRIMARY, (bar_x + bar_w + 8) as i32, (bar_y + 1) as i32,
+                PxScale::from(18.0), &font_bold, &qty_label);
+        }
+
+        let path = parent.join(format!("{}_rarity.{}", stem, ext));
+        canvas.save(&path)?;
+        paths.push(path);
+    }
+
+    Ok(paths)
 }

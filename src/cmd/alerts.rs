@@ -714,6 +714,7 @@ pub async fn run(
     range: HistoryRange,
     chart: bool,
     chart_output: &str,
+    split: bool,
     post: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("=== TCG Volume & Sales Report ===\n");
@@ -781,27 +782,50 @@ pub async fn run(
             let start_date = (Utc::now() - chrono::Duration::hours(48)).format("%b %d");
             let title = format!("Riftbound Top Sellers — {} to {}", start_date, end_date);
             let path = std::path::PathBuf::from(chart_output);
-            match super::graphic::generate_graphic(&graphic_cards, &title, &path).await {
-                Ok(()) => {
-                    println!("\n  Graphic saved to {}", path.display());
-                    graphic_generated = true;
+
+            if split {
+                match super::graphic::generate_split_graphics(&graphic_cards, &title, &path).await {
+                    Ok(paths) => {
+                        for p in &paths {
+                            println!("\n  Graphic saved to {}", p.display());
+                        }
+                        graphic_generated = true;
+                    }
+                    Err(e) => eprintln!("\n  Failed to generate graphics: {}", e),
                 }
-                Err(e) => eprintln!("\n  Failed to generate graphic: {}", e),
+            } else {
+                match super::graphic::generate_graphic(&graphic_cards, &title, &path).await {
+                    Ok(()) => {
+                        println!("\n  Graphic saved to {}", path.display());
+                        graphic_generated = true;
+                    }
+                    Err(e) => eprintln!("\n  Failed to generate graphic: {}", e),
+                }
             }
 
-            if post && path.exists() {
-                let tweet_text = format!(
-                    "Top selling cards (last 48h): {}",
-                    graphic_cards
-                        .top_overall
-                        .iter()
-                        .map(|e| e.product_name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                match super::x_post::post_graphic(&path, &tweet_text).await {
-                    Ok(url) => println!("  Posted to X: {}", url),
-                    Err(e) => eprintln!("  Failed to post to X: {}", e),
+            if post && graphic_generated {
+                let post_path = if split {
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                    let ext = path.extension().unwrap_or_default().to_string_lossy();
+                    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+                    parent.join(format!("{}_sellers.{}", stem, ext))
+                } else {
+                    path.clone()
+                };
+                if post_path.exists() {
+                    let tweet_text = format!(
+                        "Top selling cards (last 48h): {}",
+                        graphic_cards
+                            .top_overall
+                            .iter()
+                            .map(|e| e.product_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    match super::x_post::post_graphic(&post_path, &tweet_text).await {
+                        Ok(url) => println!("  Posted to X: {}", url),
+                        Err(e) => eprintln!("  Failed to post to X: {}", e),
+                    }
                 }
             }
         }
