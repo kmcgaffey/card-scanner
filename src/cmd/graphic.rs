@@ -754,7 +754,7 @@ fn draw_mover_row(
     let right_edge = section_x + section_w;
 
     // Card name
-    let name = truncate(&mover.product_name, 24);
+    let name = truncate(&mover.display_name, 24);
     draw_text_mut(canvas, TEXT_PRIMARY, text_x as i32, (center_y - 28) as i32,
         PxScale::from(20.0), font_bold, &name);
 
@@ -825,14 +825,14 @@ pub async fn generate_movers_graphic(
 
     let gainer_entries: Vec<CardEntry> = top_gainers.iter().map(|m| CardEntry {
         product_id: m.product_id, product_name: m.product_name.clone(),
-        display_name: m.product_name.clone(), total_qty: m.volume,
-        rarity: m.rarity.clone(), fallback_product_id: None,
+        display_name: m.display_name.clone(), total_qty: m.volume,
+        rarity: m.rarity.clone(), fallback_product_id: m.fallback_product_id,
         avg_price: m.current_price, price_change_pct: Some(m.change_pct),
     }).collect();
     let loser_entries: Vec<CardEntry> = top_losers.iter().map(|m| CardEntry {
         product_id: m.product_id, product_name: m.product_name.clone(),
-        display_name: m.product_name.clone(), total_qty: m.volume,
-        rarity: m.rarity.clone(), fallback_product_id: None,
+        display_name: m.display_name.clone(), total_qty: m.volume,
+        rarity: m.rarity.clone(), fallback_product_id: m.fallback_product_id,
         avg_price: m.current_price, price_change_pct: Some(m.change_pct),
     }).collect();
 

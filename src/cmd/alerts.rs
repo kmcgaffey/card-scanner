@@ -557,12 +557,14 @@ fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> Grap
 pub(crate) struct PriceMover {
     pub(crate) product_id: u64,
     pub(crate) product_name: String,
+    pub(crate) display_name: String,
     pub(crate) rarity: String,
     pub(crate) set_name: String,
     pub(crate) current_price: f64,
     pub(crate) previous_price: f64,
     pub(crate) change_pct: f64,
     pub(crate) volume: u32,
+    pub(crate) fallback_product_id: Option<u64>,
 }
 
 /// Query cards with the biggest price changes from daily_volume across all connections.
@@ -598,15 +600,18 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
                 let current: f64 = row.get(3)?;
                 let previous: f64 = row.get(4)?;
                 let pct = (current - previous) / previous * 100.0;
+                let name: String = row.get(0)?;
                 Ok(PriceMover {
                     product_id: row.get::<_, i64>(6)? as u64,
-                    product_name: row.get(0)?,
+                    product_name: name.clone(),
+                    display_name: name,
                     rarity: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                     set_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     current_price: current,
                     previous_price: previous,
                     change_pct: pct,
                     volume: row.get(5)?,
+                    fallback_product_id: None,
                 })
             })
             .ok();
@@ -616,7 +621,18 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
         }
     }
 
-    // Split into gainers and losers, sorted by magnitude
+    // Enrich movers with fallback image IDs and promo display names
+    for m in &mut all_movers {
+        m.fallback_product_id = lookup_fallback_product_id(conns, m.product_id, &m.product_name);
+        if m.rarity == "Promo" {
+            if let Some(num) = lookup_card_number(conns, m.product_id) {
+                m.display_name = format!("(Promo) {} ({})", m.product_name, num);
+            } else {
+                m.display_name = format!("(Promo) {}", m.product_name);
+            }
+        }
+    }
+
     // Split into gainers and losers
     all_movers.sort_by(|a, b| b.change_pct.partial_cmp(&a.change_pct).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -630,7 +646,6 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
         }
     }
     losers.sort_by(|a, b| a.change_pct.partial_cmp(&b.change_pct).unwrap_or(std::cmp::Ordering::Equal));
-    losers.truncate(top_n);
     losers.truncate(top_n);
 
     (gainers, losers)
