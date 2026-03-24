@@ -3,7 +3,7 @@ use std::path::Path;
 use ab_glyph::{FontRef, PxScale};
 use image::imageops::FilterType;
 use image::{DynamicImage, Rgba, RgbaImage};
-use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
+use imageproc::drawing::{draw_filled_rect_mut, draw_line_segment_mut, draw_text_mut};
 use imageproc::rect::Rect;
 
 use super::alerts::{CardEntry, GraphicCards, PriceMover};
@@ -123,14 +123,26 @@ async fn download_images(
 }
 
 /// Format a price change as arrow + percentage string.
-fn format_price_change(pct: f64) -> (String, Rgba<u8>) {
+fn format_price_change(pct: f64) -> Option<(String, Rgba<u8>)> {
     if pct > 0.5 {
-        (format!("\u{25B2}{:.1}%", pct.abs()), PRICE_UP)
+        Some((format!("\u{25B2}{:.1}%", pct.abs()), PRICE_UP))
     } else if pct < -0.5 {
-        (format!("\u{25BC}{:.1}%", pct.abs()), PRICE_DOWN)
+        Some((format!("\u{25BC}{:.1}%", pct.abs()), PRICE_DOWN))
     } else {
-        ("-0.0%".to_string(), PRICE_FLAT)
+        None
     }
+}
+
+/// Draw @CCGFinance watermark in the bottom-right corner.
+fn draw_watermark(canvas: &mut RgbaImage) {
+    let font = FontRef::try_from_slice(FONT_REGULAR).expect("font");
+    let label = "@CCGFinance";
+    let font_size = 14.0f32;
+    let w = text_width(label, font_size);
+    let x = (canvas.width() - w - 12) as i32;
+    let y = (canvas.height() - 22) as i32;
+    let color = Rgba([120, 120, 140, 180]); // subtle semi-transparent
+    draw_text_mut(canvas, color, x, y, PxScale::from(font_size), &font, label);
 }
 
 /// Estimate text width in pixels for a given font size (approximate).
@@ -205,7 +217,7 @@ fn draw_row(
 
     // Price + change (right-justified)
     let price_font_size = 16.0f32;
-    let change_str = card.price_change_pct.map(|pct| format_price_change(pct));
+    let change_str = card.price_change_pct.and_then(|pct| format_price_change(pct));
     let price_label = format!("${:.2}", card.avg_price);
     let change_w = change_str.as_ref().map(|(s, _)| text_width(s, price_font_size) + 4).unwrap_or(0);
     let price_w = text_width(&price_label, price_font_size);
@@ -489,7 +501,7 @@ pub async fn generate_graphic(
 
             // Price + change (right-justified)
             let r_price_font = 15.0f32;
-            let r_change_str = card.price_change_pct.map(|pct| format_price_change(pct));
+            let r_change_str = card.price_change_pct.and_then(|pct| format_price_change(pct));
             let r_price_label = format!("${:.2}", card.avg_price);
             let r_change_w = r_change_str.as_ref().map(|(s, _)| text_width(s, r_price_font) + 4).unwrap_or(0);
             let r_price_w = text_width(&r_price_label, r_price_font);
@@ -553,6 +565,7 @@ pub async fn generate_graphic(
         ACCENT,
     );
 
+    draw_watermark(&mut canvas);
     canvas.save(output_path)?;
     Ok(())
 }
@@ -619,6 +632,7 @@ pub async fn generate_split_graphics(
         }
 
         let path = parent.join(format!("{}_sellers.{}", stem, ext));
+        draw_watermark(&mut canvas);
         canvas.save(&path)?;
         paths.push(path);
     }
@@ -675,7 +689,7 @@ pub async fn generate_split_graphics(
 
             // Price + change (right-justified)
             let r_price_font = 16.0f32;
-            let r_change_str = card.price_change_pct.map(|pct| format_price_change(pct));
+            let r_change_str = card.price_change_pct.and_then(|pct| format_price_change(pct));
             let r_price_label = format!("${:.2}", card.avg_price);
             let r_change_w = r_change_str.as_ref().map(|(s, _)| text_width(s, r_price_font) + 4).unwrap_or(0);
             let r_price_w = text_width(&r_price_label, r_price_font);
@@ -705,6 +719,7 @@ pub async fn generate_split_graphics(
         }
 
         let path = parent.join(format!("{}_rarity.{}", stem, ext));
+        draw_watermark(&mut canvas);
         canvas.save(&path)?;
         paths.push(path);
     }
@@ -873,6 +888,85 @@ pub async fn generate_movers_graphic(
             &loser_images[i], i, row_y, loser_row_h, false, max_loss, right_x, half_w);
     }
 
+    draw_watermark(&mut canvas);
+    canvas.save(output_path)?;
+    Ok(())
+}
+
+/// Generate a two-column graphic showing only the top gainers (5 per column).
+pub async fn generate_gainers_graphic(
+    gainers: &[PriceMover],
+    title: &str,
+    output_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if gainers.is_empty() {
+        return Err("No gainers to render".into());
+    }
+
+    let font_bold = FontRef::try_from_slice(FONT_BOLD)?;
+    let font_regular = FontRef::try_from_slice(FONT_REGULAR)?;
+    let client = reqwest::Client::new();
+
+    let top = &gainers[..gainers.len().min(10)];
+
+    let entries: Vec<CardEntry> = top.iter().map(|m| CardEntry {
+        product_id: m.product_id, product_name: m.product_name.clone(),
+        display_name: m.display_name.clone(), total_qty: m.volume,
+        rarity: m.rarity.clone(), fallback_product_id: m.fallback_product_id,
+        avg_price: m.current_price, price_change_pct: Some(m.change_pct),
+    }).collect();
+
+    let images = download_images(&client, &entries).await;
+
+    let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
+    draw_chrome(&mut canvas, &font_bold, title, WIDTH, HEIGHT);
+
+    let content_top = 70u32;
+    let content_bottom = HEIGHT - 16;
+    let content_h = content_bottom - content_top;
+    let section_top = content_top + 26;
+
+    let half_w = WIDTH / 2 - 4;
+    let right_x = WIDTH / 2 + 4;
+
+    // Split into left (1-5) and right (6-10) columns
+    let left = &top[..top.len().min(5)];
+    let right = if top.len() > 5 { &top[5..] } else { &[] };
+
+    let max_gain = top.iter().map(|m| m.change_pct).fold(0.0f64, f64::max);
+
+    // Left column header
+    draw_text_mut(&mut canvas, PRICE_UP, 18, (content_top + 2) as i32,
+        PxScale::from(16.0), &font_bold, "\u{25B2} TOP GAINERS");
+
+    let row_h = (content_h - 26) / left.len().max(1) as u32;
+
+    for (i, mover) in left.iter().enumerate() {
+        let row_y = section_top + (i as u32) * row_h;
+        draw_mover_row(&mut canvas, &font_bold, &font_regular, mover,
+            &images[i], i, row_y, row_h, true, max_gain, 0, half_w);
+    }
+
+    // Vertical divider
+    draw_filled_rect_mut(&mut canvas,
+        Rect::at((WIDTH / 2) as i32, content_top as i32).of_size(2, content_h),
+        Rgba([40, 40, 60, 255]));
+
+    // Right column
+    if !right.is_empty() {
+        draw_text_mut(&mut canvas, PRICE_UP, (right_x + 6) as i32, (content_top + 2) as i32,
+            PxScale::from(16.0), &font_bold, "\u{25B2} TOP GAINERS (cont.)");
+
+        let right_row_h = (content_h - 26) / right.len().max(1) as u32;
+
+        for (i, mover) in right.iter().enumerate() {
+            let row_y = section_top + (i as u32) * right_row_h;
+            draw_mover_row(&mut canvas, &font_bold, &font_regular, mover,
+                &images[5 + i], i, row_y, right_row_h, true, max_gain, right_x, half_w);
+        }
+    }
+
+    draw_watermark(&mut canvas);
     canvas.save(output_path)?;
     Ok(())
 }
@@ -921,17 +1015,19 @@ fn draw_seal_row(
         PxScale::from(20.0), font_bold, &name);
 
     // Price + change (right-justified)
-    let (change_label, change_color) = format_price_change(seal.change_pct);
+    let change_info = format_price_change(seal.change_pct);
     let price_label = format!("${:.2}", seal.current_price);
-    let change_w = text_width(&change_label, 16.0);
+    let change_w = change_info.as_ref().map(|(s, _)| text_width(s, 16.0) + 8).unwrap_or(0);
     let price_w = text_width(&price_label, 18.0);
-    let total_w = price_w + change_w + 8;
+    let total_w = price_w + change_w;
     let price_x = right_edge - total_w - padding;
 
     draw_text_mut(canvas, TEXT_PRIMARY, price_x as i32, (center_y - 28) as i32,
         PxScale::from(18.0), font_bold, &price_label);
-    draw_text_mut(canvas, change_color, (price_x + price_w + 8) as i32, (center_y - 26) as i32,
-        PxScale::from(16.0), font_bold, &change_label);
+    if let Some((change_label, change_color)) = &change_info {
+        draw_text_mut(canvas, *change_color, (price_x + price_w + 8) as i32, (center_y - 26) as i32,
+            PxScale::from(16.0), font_bold, change_label);
+    }
 
     // Volume + previous price on second line
     let detail = format!("{} sold  (was ${:.2})", seal.volume_48h, seal.previous_price);
@@ -1013,6 +1109,149 @@ pub async fn generate_seals_graphic(
             &right_images[i], i, row_y, right_row_h, right_x, half_w);
     }
 
+    draw_watermark(&mut canvas);
+    canvas.save(output_path)?;
+    Ok(())
+}
+
+/// A data series for the line chart.
+pub struct IndexSeries {
+    pub label: String,
+    pub color: Rgba<u8>,
+    pub points: Vec<(String, f64)>, // (date_label, value)
+}
+
+/// Generate a line chart overlaying multiple index series.
+pub fn generate_index_chart(
+    series: &[IndexSeries],
+    title: &str,
+    output_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if series.is_empty() || series.iter().all(|s| s.points.is_empty()) {
+        return Err("No data to chart".into());
+    }
+
+    let font_bold = FontRef::try_from_slice(FONT_BOLD)?;
+    let font_regular = FontRef::try_from_slice(FONT_REGULAR)?;
+
+    let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
+    draw_chrome(&mut canvas, &font_bold, title, WIDTH, HEIGHT);
+
+    let left_margin = 90u32;
+    let right_margin = 60u32;
+    let top_margin = 85u32;
+    let bottom_margin = 60u32;
+    let chart_w = WIDTH - left_margin - right_margin;
+    let chart_h = HEIGHT - top_margin - bottom_margin;
+
+    // Global min/max with 5% padding
+    let all_vals: Vec<f64> = series.iter().flat_map(|s| s.points.iter().map(|(_, v)| *v)).collect();
+    let raw_min = all_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let raw_max = all_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = raw_max - raw_min;
+    let y_min = raw_min - range * 0.05;
+    let y_max = raw_max + range * 0.05;
+
+    // Chart background
+    draw_filled_rect_mut(&mut canvas,
+        Rect::at(left_margin as i32, top_margin as i32).of_size(chart_w, chart_h),
+        Rgba([22, 22, 36, 255]));
+
+    // Horizontal grid lines + Y labels
+    let grid_color = Rgba([40, 40, 60, 255]);
+    let num_grid = 5u32;
+    for i in 0..=num_grid {
+        let y = top_margin + chart_h - (i as f32 / num_grid as f32 * chart_h as f32) as u32;
+        let val = y_min + (i as f64 / num_grid as f64) * (y_max - y_min);
+        draw_line_segment_mut(&mut canvas,
+            (left_margin as f32, y as f32),
+            ((left_margin + chart_w) as f32, y as f32),
+            grid_color);
+        let label = format!("${:.0}", val);
+        let lw = text_width(&label, 12.0);
+        draw_text_mut(&mut canvas, TEXT_SECONDARY,
+            (left_margin - lw - 6) as i32, (y - 6) as i32,
+            PxScale::from(12.0), &font_regular, &label);
+    }
+
+    // X-axis labels from longest series
+    let max_points = series.iter().map(|s| s.points.len()).max().unwrap_or(1);
+    let longest = series.iter().max_by_key(|s| s.points.len()).unwrap();
+    let label_interval = (longest.points.len() / 6).max(1);
+    for (i, (date, _)) in longest.points.iter().enumerate() {
+        if i % label_interval == 0 || i == longest.points.len() - 1 {
+            let x = left_margin + (i as f32 / (max_points - 1).max(1) as f32 * chart_w as f32) as u32;
+            let short = if date.len() >= 8 {
+                let parts: Vec<&str> = date.split('-').collect();
+                if parts.len() == 3 {
+                    let month = match parts[1] {
+                        "01" => "Jan", "02" => "Feb", "03" => "Mar", "04" => "Apr",
+                        "05" => "May", "06" => "Jun", "07" => "Jul", "08" => "Aug",
+                        "09" => "Sep", "10" => "Oct", "11" => "Nov", "12" => "Dec",
+                        _ => parts[1],
+                    };
+                    format!("{} {}", month, parts[2])
+                } else { date.clone() }
+            } else { date.clone() };
+            let lw = text_width(&short, 11.0);
+            draw_text_mut(&mut canvas, TEXT_SECONDARY,
+                (x - lw / 2) as i32, (top_margin + chart_h + 8) as i32,
+                PxScale::from(11.0), &font_regular, &short);
+            draw_line_segment_mut(&mut canvas,
+                (x as f32, (top_margin + chart_h) as f32),
+                (x as f32, (top_margin + chart_h + 4) as f32),
+                grid_color);
+        }
+    }
+
+    // Draw lines for each series
+    for s in series {
+        if s.points.len() < 2 { continue; }
+        let n = s.points.len();
+        for i in 1..n {
+            let x1 = left_margin as f32 + ((i - 1) as f32 / (max_points - 1).max(1) as f32 * chart_w as f32);
+            let x2 = left_margin as f32 + (i as f32 / (max_points - 1).max(1) as f32 * chart_w as f32);
+            let y1 = top_margin as f32 + chart_h as f32 - ((s.points[i-1].1 - y_min) / (y_max - y_min) * chart_h as f64) as f32;
+            let y2 = top_margin as f32 + chart_h as f32 - ((s.points[i].1 - y_min) / (y_max - y_min) * chart_h as f64) as f32;
+            for offset in -1i32..=1 {
+                draw_line_segment_mut(&mut canvas,
+                    (x1, y1 + offset as f32), (x2, y2 + offset as f32), s.color);
+            }
+        }
+        // Endpoint dot + value label
+        if let Some((_, val)) = s.points.last() {
+            let ex = left_margin as f32 + ((n - 1) as f32 / (max_points - 1).max(1) as f32 * chart_w as f32);
+            let ey = top_margin as f32 + chart_h as f32 - ((*val - y_min) / (y_max - y_min) * chart_h as f64) as f32;
+            for dx in -3i32..=3 {
+                for dy in -3i32..=3 {
+                    if dx * dx + dy * dy <= 9 {
+                        let px = (ex as i32 + dx).max(0) as u32;
+                        let py = (ey as i32 + dy).max(0) as u32;
+                        if px < WIDTH && py < HEIGHT { canvas.put_pixel(px, py, s.color); }
+                    }
+                }
+            }
+            let val_label = format!("${:.0}", val);
+            draw_text_mut(&mut canvas, s.color,
+                (ex + 8.0) as i32, (ey - 6.0) as i32,
+                PxScale::from(13.0), &font_bold, &val_label);
+        }
+    }
+
+    // Legend
+    let legend_y = top_margin - 18;
+    let mut legend_x = left_margin;
+    for s in series {
+        draw_filled_rect_mut(&mut canvas,
+            Rect::at(legend_x as i32, legend_y as i32).of_size(14, 14), s.color);
+        legend_x += 18;
+        draw_text_mut(&mut canvas, TEXT_PRIMARY,
+            legend_x as i32, legend_y as i32,
+            PxScale::from(13.0), &font_bold, &s.label);
+        legend_x += text_width(&s.label, 13.0) + 24;
+    }
+
+    draw_watermark(&mut canvas);
     canvas.save(output_path)?;
     Ok(())
 }

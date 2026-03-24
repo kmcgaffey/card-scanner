@@ -193,6 +193,17 @@ pub fn init_db(conn: &Connection) {
             ON daily_volume(product_id, bucket_date);
         CREATE INDEX IF NOT EXISTS idx_daily_volume_date
             ON daily_volume(bucket_date);
+
+        CREATE TABLE IF NOT EXISTS price_index (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bucket_date     TEXT NOT NULL,
+            rarity          TEXT NOT NULL,
+            total_value     REAL NOT NULL,
+            card_count      INTEGER NOT NULL,
+            UNIQUE(bucket_date, rarity)
+        );
+        CREATE INDEX IF NOT EXISTS idx_price_index_date
+            ON price_index(bucket_date);
         ",
     )
     .expect("Failed to initialize database schema");

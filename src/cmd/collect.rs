@@ -314,6 +314,37 @@ pub async fn run(profile_name: &str) -> std::result::Result<(), Box<dyn std::err
     let sale_total: u32 = conn.query_row("SELECT COUNT(*) FROM sales", [], |r| r.get(0))?;
     let vol_total: u32 = conn.query_row("SELECT COUNT(*) FROM daily_volume", [], |r| r.get(0))?;
 
+    // --- Phase 6: Compute daily price index ---
+    println!("\n=== Phase 6: Computing daily price index ===");
+    conn.execute_batch(
+        "INSERT OR REPLACE INTO price_index (bucket_date, rarity, total_value, card_count)
+         SELECT dv.bucket_date, c.rarity,
+                ROUND(SUM(min_price), 2) as total_value,
+                COUNT(*) as card_count
+         FROM (
+             SELECT product_id, bucket_date, MIN(market_price) as min_price
+             FROM daily_volume
+             WHERE condition = 'Near Mint' AND market_price > 0
+             GROUP BY product_id, bucket_date
+         ) dv
+         JOIN cards c ON c.product_id = dv.product_id
+         WHERE c.product_name NOT LIKE '%(Signature)%'
+         GROUP BY dv.bucket_date, c.rarity;"
+    )?;
+    let idx_total: u32 = conn.query_row("SELECT COUNT(*) FROM price_index", [], |r| r.get(0))?;
+    println!("  Price index records: {}", idx_total);
+
+    // Also store an 'All' row summing all rarities per day
+    conn.execute_batch(
+        "INSERT OR REPLACE INTO price_index (bucket_date, rarity, total_value, card_count)
+         SELECT bucket_date, 'All',
+                ROUND(SUM(total_value), 2),
+                SUM(card_count)
+         FROM price_index
+         WHERE rarity != 'All'
+         GROUP BY bucket_date;"
+    )?;
+
     println!("\n=== Collection Complete ===");
     println!("  Cards in DB:          {}", card_count);
     println!("  Price snapshots:      {}", snapshot_count);

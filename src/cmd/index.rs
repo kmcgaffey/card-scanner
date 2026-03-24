@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use image::Rgba;
 use rusqlite::Connection;
 
 use super::common::load_profile;
+use super::graphic::IndexSeries;
 
 /// A single rarity tier within a set index.
 struct RarityBucket {
@@ -119,7 +121,16 @@ fn print_set_index(idx: &SetIndex) {
     }
 }
 
-pub fn run(profiles: &[String]) -> std::result::Result<(), Box<dyn std::error::Error>> {
+const SERIES_COLORS: [Rgba<u8>; 6] = [
+    Rgba([79, 140, 255, 255]),  // blue
+    Rgba([240, 160, 50, 255]),  // orange
+    Rgba([80, 200, 120, 255]),  // green
+    Rgba([220, 80, 180, 255]),  // pink
+    Rgba([56, 178, 226, 255]),  // cyan
+    Rgba([220, 100, 100, 255]), // red
+];
+
+pub fn run(profiles: &[String], chart: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let profile_names: Vec<String> = if profiles.is_empty() {
         // Load all profiles from profiles.toml
         let config_path = PathBuf::from("profiles.toml");
@@ -207,6 +218,55 @@ pub fn run(profiles: &[String]) -> std::result::Result<(), Box<dyn std::error::E
                 "    {:<20} ${:>10.2}  ({} cards)",
                 idx.set_name, idx.total_value, idx.total_cards
             );
+        }
+    }
+
+    // Generate line chart from price_index table
+    if chart {
+        let mut all_series: Vec<IndexSeries> = Vec::new();
+
+        for (i, name) in profile_names.iter().enumerate() {
+            let profile = load_profile(name);
+            let db_path = PathBuf::from(&profile.db_path);
+            if !db_path.exists() { continue; }
+            let conn = Connection::open(&db_path)?;
+
+            // Check if price_index table exists
+            let has_table: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_index'",
+                [], |r| r.get::<_, i64>(0)
+            ).unwrap_or(0) > 0;
+            if !has_table { continue; }
+
+            let mut stmt = conn.prepare(
+                "SELECT bucket_date, total_value FROM price_index
+                 WHERE rarity = 'All'
+                   AND card_count >= (SELECT MAX(card_count) FROM price_index WHERE rarity = 'All')
+                 ORDER BY bucket_date"
+            )?;
+            let points: Vec<(String, f64)> = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?.filter_map(|r| r.ok()).collect();
+
+            if !points.is_empty() {
+                all_series.push(IndexSeries {
+                    label: format!("{} ({} cards)", profile.set_name, conn.query_row(
+                        "SELECT MAX(card_count) FROM price_index WHERE rarity = 'All'",
+                        [], |r| r.get::<_, u32>(0)
+                    ).unwrap_or(0)),
+                    color: SERIES_COLORS[i % SERIES_COLORS.len()],
+                    points,
+                });
+            }
+        }
+
+        if !all_series.is_empty() {
+            let output = PathBuf::from("index_chart.png");
+            let title = "Riftbound Price Index";
+            match super::graphic::generate_index_chart(&all_series, title, &output) {
+                Ok(()) => println!("\n  Index chart saved to {}", output.display()),
+                Err(e) => eprintln!("\n  Failed to generate index chart: {}", e),
+            }
         }
     }
 

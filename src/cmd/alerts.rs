@@ -130,12 +130,23 @@ fn lookup_card_number(conns: &[&Connection], product_id: u64) -> Option<String> 
 /// Compares the most recent day's market_price to the oldest day in the window.
 fn lookup_price_change(conns: &[&Connection], product_id: u64) -> Option<f64> {
     for conn in conns {
-        // Get the two most recent daily prices for this card
+        // Find the highest-volume variant for this card, then get its price change
         let mut stmt = conn
             .prepare(
-                "SELECT market_price FROM daily_volume
-                 WHERE product_id = ?1 AND market_price IS NOT NULL AND market_price > 0
-                 ORDER BY bucket_date DESC LIMIT 2",
+                "WITH top_variant AS (
+                    SELECT variant
+                    FROM daily_volume
+                    WHERE product_id = ?1 AND condition = 'Near Mint' AND quantity_sold > 0
+                    GROUP BY variant
+                    ORDER BY SUM(quantity_sold) DESC
+                    LIMIT 1
+                )
+                SELECT market_price FROM daily_volume
+                WHERE product_id = ?1 AND condition = 'Near Mint'
+                  AND variant = (SELECT variant FROM top_variant)
+                  AND market_price IS NOT NULL AND market_price > 0
+                  AND quantity_sold > 0
+                ORDER BY bucket_date DESC LIMIT 2",
             )
             .ok()?;
         let prices: Vec<f64> = stmt
@@ -341,17 +352,33 @@ fn query_top_purchased(conn: &Connection, hours: i64) -> Vec<TopPurchased> {
 fn query_top_from_volume(conn: &Connection, cutoff: &str) -> Vec<TopPurchased> {
     let mut stmt = conn
         .prepare(
-            "SELECT v.product_id, c.product_name, c.set_name, c.rarity,
-                    SUM(v.quantity_sold) as total_qty,
-                    SUM(v.quantity_sold) as txn_count,
-                    ROUND(AVG(v.market_price), 2) as avg_price,
-                    ROUND(MIN(v.low_price), 2) as low_price,
-                    ROUND(MAX(v.high_price), 2) as high_price
-             FROM daily_volume v
-             JOIN cards c ON c.product_id = v.product_id
-             WHERE v.bucket_date >= ?1
-             GROUP BY v.product_id
-             ORDER BY c.rarity, total_qty DESC",
+            "WITH per_variant AS (
+                SELECT v.product_id, v.variant,
+                       SUM(v.quantity_sold) as variant_qty,
+                       ROUND(AVG(v.market_price), 2) as avg_price,
+                       ROUND(MIN(v.low_price), 2) as low_price,
+                       ROUND(MAX(v.high_price), 2) as high_price
+                FROM daily_volume v
+                WHERE v.bucket_date >= ?1 AND v.condition = 'Near Mint'
+                GROUP BY v.product_id, v.variant
+             ),
+             totals AS (
+                SELECT product_id, SUM(variant_qty) as total_qty
+                FROM per_variant
+                GROUP BY product_id
+             ),
+             ranked AS (
+                SELECT pv.product_id, pv.avg_price, pv.low_price, pv.high_price,
+                       t.total_qty, c.product_name, c.set_name, c.rarity,
+                       ROW_NUMBER() OVER (PARTITION BY pv.product_id ORDER BY pv.variant_qty DESC) as rn
+                FROM per_variant pv
+                JOIN totals t ON t.product_id = pv.product_id
+                JOIN cards c ON c.product_id = pv.product_id
+             )
+             SELECT product_id, product_name, set_name, rarity,
+                    total_qty, total_qty as txn_count, avg_price, low_price, high_price
+             FROM ranked WHERE rn = 1
+             ORDER BY rarity, total_qty DESC",
         )
         .expect("Failed to prepare volume query");
 
@@ -526,9 +553,8 @@ fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> Grap
         .map(|r| make_card_entry(r, conn_refs))
         .collect();
 
-    // Top 1 per rarity (skip cards already in top_overall)
+    // Top 1 per rarity (always populate, even if duplicated in top_overall)
     let rarity_order = ["Common", "Uncommon", "Rare", "Epic", "Showcase", "Promo"];
-    let top_ids: Vec<u64> = top_overall.iter().map(|c| c.product_id).collect();
 
     let mut by_rarity: HashMap<&str, Vec<&TopPurchased>> = HashMap::new();
     for row in rows {
@@ -538,11 +564,8 @@ fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> Grap
     let mut top_by_rarity: Vec<CardEntry> = Vec::new();
     for rarity in &rarity_order {
         if let Some(cards) = by_rarity.get(rarity) {
-            // Find the top card in this rarity that isn't already in top_overall
             if let Some(best) = cards.iter().max_by_key(|c| c.total_qty) {
-                if !top_ids.contains(&best.product_id) {
-                    top_by_rarity.push(make_card_entry(best, conn_refs));
-                }
+                top_by_rarity.push(make_card_entry(best, conn_refs));
             }
         }
     }
@@ -560,6 +583,7 @@ pub(crate) struct PriceMover {
     pub(crate) display_name: String,
     pub(crate) rarity: String,
     pub(crate) set_name: String,
+    pub(crate) variant: String,
     pub(crate) current_price: f64,
     pub(crate) previous_price: f64,
     pub(crate) change_pct: f64,
@@ -568,31 +592,53 @@ pub(crate) struct PriceMover {
 }
 
 /// Query cards with the biggest price changes from daily_volume across all connections.
-fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, Vec<PriceMover>) {
+/// `days` controls the lookback window (e.g. 2 for 48h, 7 for weekly).
+/// `min_pct` sets a minimum absolute % change to qualify (e.g. 30.0 for 30%+).
+/// If `min_pct` is set, `top_n` is ignored for gainers and all qualifying cards are returned.
+fn query_price_movers(conns: &[&Connection], top_n: usize, days: u32, min_pct: Option<f64>) -> (Vec<PriceMover>, Vec<PriceMover>) {
     let mut all_movers: Vec<PriceMover> = Vec::new();
 
     for conn in conns {
         let mut stmt = match conn.prepare(
-            "WITH ranked AS (
+            "WITH recent_dates AS (
+                SELECT DISTINCT bucket_date FROM daily_volume
+                WHERE quantity_sold > 0
+                ORDER BY bucket_date DESC
+             ),
+             current_date AS (
+                SELECT bucket_date FROM recent_dates LIMIT 1
+             ),
+             previous_date AS (
+                SELECT bucket_date FROM recent_dates LIMIT 1 OFFSET ?1
+             ),
+             window_volume AS (
+                SELECT product_id, variant, SUM(quantity_sold) as total_vol
+                FROM daily_volume
+                WHERE condition = 'Near Mint'
+                  AND bucket_date > (SELECT bucket_date FROM previous_date)
+                  AND bucket_date <= (SELECT bucket_date FROM current_date)
+                GROUP BY product_id, variant
+             ),
+             ranked AS (
                 SELECT c.product_name, c.rarity, c.set_name,
                        v1.market_price as current_price,
                        v2.market_price as previous_price,
-                       v1.quantity_sold as volume,
+                       COALESCE(wv.total_vol, 0) as volume,
                        v1.product_id,
                        v1.variant,
-                       ROW_NUMBER() OVER (PARTITION BY v1.product_id ORDER BY v1.quantity_sold DESC) as rn
+                       ROW_NUMBER() OVER (PARTITION BY v1.product_id, v1.variant ORDER BY COALESCE(wv.total_vol, 0) DESC) as rn
                 FROM daily_volume v1
                 JOIN daily_volume v2 ON v1.product_id = v2.product_id
                      AND v2.variant = v1.variant AND v2.condition = v1.condition
+                LEFT JOIN window_volume wv ON wv.product_id = v1.product_id AND wv.variant = v1.variant
                 JOIN cards c ON c.product_id = v1.product_id
-                WHERE v1.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
-                  AND v2.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume
-                                        WHERE bucket_date < (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
-                                          AND quantity_sold > 0)
+                WHERE v1.bucket_date = (SELECT bucket_date FROM current_date)
+                  AND v2.bucket_date = (SELECT bucket_date FROM previous_date)
                   AND v1.market_price > 0 AND v2.market_price >= 0.50
                   AND v1.condition = 'Near Mint'
+                  AND COALESCE(wv.total_vol, 0) >= 3
              )
-             SELECT product_name, rarity, set_name, current_price, previous_price, volume, product_id
+             SELECT product_name, rarity, set_name, current_price, previous_price, volume, product_id, variant
              FROM ranked WHERE rn = 1
              ORDER BY ABS((current_price - previous_price) / previous_price) DESC",
         ) {
@@ -601,17 +647,20 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
         };
 
         let rows = stmt
-            .query_map([], |row| {
+            .query_map([days], |row| {
                 let current: f64 = row.get(3)?;
                 let previous: f64 = row.get(4)?;
                 let pct = (current - previous) / previous * 100.0;
                 let name: String = row.get(0)?;
+                let variant: String = row.get::<_, Option<String>>(7)?.unwrap_or_default();
+                let rarity: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
                 Ok(PriceMover {
                     product_id: row.get::<_, i64>(6)? as u64,
                     product_name: name.clone(),
                     display_name: name,
-                    rarity: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    rarity,
                     set_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    variant,
                     current_price: current,
                     previous_price: previous,
                     change_pct: pct,
@@ -626,7 +675,7 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
         }
     }
 
-    // Enrich movers with fallback image IDs and promo display names
+    // Enrich movers with fallback image IDs, promo display names, and foil tags
     for m in &mut all_movers {
         m.fallback_product_id = lookup_fallback_product_id(conns, m.product_id, &m.product_name);
         if m.rarity == "Promo" {
@@ -635,6 +684,8 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
             } else {
                 m.display_name = format!("(Promo) {}", m.product_name);
             }
+        } else if (m.rarity == "Common" || m.rarity == "Uncommon") && m.variant == "Foil" {
+            m.display_name = format!("(Foil) {}", m.product_name);
         }
     }
 
@@ -643,9 +694,12 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
 
     let mut gainers: Vec<PriceMover> = Vec::new();
     let mut losers: Vec<PriceMover> = Vec::new();
+    let gain_threshold = min_pct.unwrap_or(1.0);
     for m in all_movers {
-        if m.change_pct > 1.0 && gainers.len() < top_n {
-            gainers.push(m);
+        if m.change_pct >= gain_threshold {
+            if min_pct.is_some() || gainers.len() < top_n {
+                gainers.push(m);
+            }
         } else if m.change_pct < -1.0 {
             losers.push(m);
         }
@@ -672,7 +726,7 @@ fn print_price_movers(gainers: &[PriceMover], losers: &[PriceMover]) {
             };
             println!(
                 "    {:<40} {:>8} {:>8} {:>7} {:>7} {}",
-                truncate_str(&m.product_name, 39),
+                truncate_str(&m.display_name, 39),
                 format!("${:.2}", m.previous_price),
                 format!("${:.2}", m.current_price),
                 format!("+{:.1}%", m.change_pct),
@@ -697,7 +751,7 @@ fn print_price_movers(gainers: &[PriceMover], losers: &[PriceMover]) {
             };
             println!(
                 "    {:<40} {:>8} {:>8} {:>7} {:>7} {}",
-                truncate_str(&m.product_name, 39),
+                truncate_str(&m.display_name, 39),
                 format!("${:.2}", m.previous_price),
                 format!("${:.2}", m.current_price),
                 format!("{:.1}%", m.change_pct),
@@ -831,12 +885,19 @@ pub async fn run(
         println!("Sets: {}", fresh_sets.join(", "));
         print_top_by_rarity(&all_sqlite_rows, TOP_N);
 
-        // Price movers
+        // Price movers (48h)
         let conn_refs: Vec<&Connection> = fresh_conns.iter().collect();
-        let (gainers, losers) = query_price_movers(&conn_refs, 10);
+        let (gainers, losers) = query_price_movers(&conn_refs, 10, 1, None);
         if !gainers.is_empty() || !losers.is_empty() {
             println!("\n=== Biggest Price Changes (48h) ===");
             print_price_movers(&gainers, &losers);
+        }
+
+        // Weekly movers (7 days)
+        let (weekly_gainers, weekly_losers) = query_price_movers(&conn_refs, 10, 7, Some(30.0));
+        if !weekly_gainers.is_empty() || !weekly_losers.is_empty() {
+            println!("\n=== Biggest Price Changes (7 days) ===");
+            print_price_movers(&weekly_gainers, &weekly_losers);
         }
 
         // Build GraphicCards: top 5 overall + top 1 per rarity
@@ -846,7 +907,10 @@ pub async fn run(
             let end_date = Utc::now().format("%b %d");
             let start_date = (Utc::now() - chrono::Duration::hours(48)).format("%b %d");
             let title = format!("Riftbound Top Sellers — {} to {}", start_date, end_date);
-            let path = std::path::PathBuf::from(chart_output);
+            let mut path = std::path::PathBuf::from(chart_output);
+            if path.extension().is_none() {
+                path.set_extension("png");
+            }
 
             if split {
                 match super::graphic::generate_split_graphics(&graphic_cards, &title, &path).await {
@@ -913,7 +977,7 @@ pub async fn run(
                 }
             }
 
-            // Generate price movers graphic
+            // Generate price movers graphic (48h)
             if !gainers.is_empty() || !losers.is_empty() {
                 let movers_title = format!("Riftbound Price Movers — {} to {}", start_date, end_date);
                 let stem = path.file_stem().unwrap_or_default().to_string_lossy();
@@ -923,6 +987,27 @@ pub async fn run(
                 match super::graphic::generate_movers_graphic(&gainers, &losers, &movers_title, &movers_path).await {
                     Ok(()) => println!("  Movers graphic saved to {}", movers_path.display()),
                     Err(e) => eprintln!("  Failed to generate movers graphic: {}", e),
+                }
+            }
+
+            // Generate weekly gainers graphics (7 days), paginated 10 per image
+            if !weekly_gainers.is_empty() {
+                let weekly_end = Utc::now().format("%b %d");
+                let weekly_start = (Utc::now() - chrono::Duration::days(7)).format("%b %d");
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = path.extension().unwrap_or_default().to_string_lossy();
+                let parent = path.parent().unwrap_or(std::path::Path::new("."));
+
+                for (page, chunk) in weekly_gainers.chunks(10).enumerate() {
+                    let suffix = if page == 0 { String::new() } else { format!("{}", page + 1) };
+                    let weekly_title = format!("Riftbound Weekly Movers{} — {} to {}",
+                        if page > 0 { format!(" (p{})", page + 1) } else { String::new() },
+                        weekly_start, weekly_end);
+                    let weekly_path = parent.join(format!("{}_weekly{}.{}", stem, suffix, ext));
+                    match super::graphic::generate_gainers_graphic(chunk, &weekly_title, &weekly_path).await {
+                        Ok(()) => println!("  Weekly movers graphic saved to {}", weekly_path.display()),
+                        Err(e) => eprintln!("  Failed to generate weekly movers graphic: {}", e),
+                    }
                 }
             }
         }

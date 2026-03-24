@@ -62,6 +62,9 @@ enum Commands {
     Index {
         /// Profile name(s) — omit to use all profiles
         profiles: Vec<String>,
+        /// Generate a line chart of the index over time
+        #[arg(long)]
+        chart: bool,
     },
 
     /// List available profiles from profiles.toml
@@ -133,8 +136,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Commands::Fetch { product_id } => {
             cmd::fetch::run(product_id).await?;
         }
-        Commands::Index { profiles } => {
-            cmd::index::run(&profiles)?;
+        Commands::Index { profiles, chart } => {
+            cmd::index::run(&profiles, chart)?;
         }
         Commands::Profiles => {
             cmd::common::list_profiles();
