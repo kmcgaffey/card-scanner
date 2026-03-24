@@ -584,7 +584,7 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
                AND v2.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume
                                      WHERE bucket_date < (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
                                        AND quantity_sold > 0)
-               AND v1.market_price > 0 AND v2.market_price > 0
+               AND v1.market_price > 0 AND v2.market_price >= 0.50
                AND v1.condition = 'Near Mint'
              GROUP BY v1.product_id
              ORDER BY ABS((v1.market_price - v2.market_price) / v2.market_price) DESC",
