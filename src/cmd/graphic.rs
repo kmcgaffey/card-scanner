@@ -8,6 +8,16 @@ use imageproc::rect::Rect;
 
 use super::alerts::{CardEntry, GraphicCards, PriceMover};
 
+/// A seal card with price data for the seals comparison graphic.
+pub struct SealData {
+    pub product_id: u64,
+    pub name: String,
+    pub current_price: f64,
+    pub previous_price: f64,
+    pub change_pct: f64,
+    pub volume_48h: u32,
+}
+
 // Canvas dimensions (Twitter-optimized 16:9)
 const WIDTH: u32 = 1200;
 const HEIGHT: u32 = 675;
@@ -861,6 +871,146 @@ pub async fn generate_movers_graphic(
         let row_y = section_top + (i as u32) * loser_row_h;
         draw_mover_row(&mut canvas, &font_bold, &font_regular, mover,
             &loser_images[i], i, row_y, loser_row_h, false, max_loss, right_x, half_w);
+    }
+
+    canvas.save(output_path)?;
+    Ok(())
+}
+
+/// Draw a seal row with card image, name, price, change, and volume.
+fn draw_seal_row(
+    canvas: &mut RgbaImage,
+    font_bold: &FontRef,
+    font_regular: &FontRef,
+    seal: &SealData,
+    image: &Option<DynamicImage>,
+    rank: usize,
+    row_y: u32,
+    row_h: u32,
+    section_x: u32,
+    section_w: u32,
+) {
+    let center_y = row_y + row_h / 2;
+    let padding = 12u32;
+    let right_edge = section_x + section_w;
+
+    // Alternating row background
+    if rank % 2 == 0 {
+        draw_filled_rect_mut(canvas,
+            Rect::at(section_x as i32, row_y as i32).of_size(section_w, row_h),
+            Rgba([22, 22, 36, 255]));
+    }
+
+    // Card image
+    let card_h = row_h.saturating_sub(8);
+    let card_w = (card_h as f32 * 0.715) as u32;
+    let thumb_x = section_x + padding;
+    let card_y = row_y + 4;
+    if let Some(ref img) = image {
+        let fitted = resize_fit(img, card_w, card_h);
+        let img_x = thumb_x + (card_w.saturating_sub(fitted.width())) / 2;
+        let img_y = card_y + (card_h.saturating_sub(fitted.height())) / 2;
+        image::imageops::overlay(canvas, &fitted, img_x as i64, img_y as i64);
+    }
+
+    let text_x = thumb_x + card_w + 10;
+
+    // Card name
+    let name = truncate(&seal.name, 22);
+    draw_text_mut(canvas, TEXT_PRIMARY, text_x as i32, (center_y - 28) as i32,
+        PxScale::from(20.0), font_bold, &name);
+
+    // Price + change (right-justified)
+    let (change_label, change_color) = format_price_change(seal.change_pct);
+    let price_label = format!("${:.2}", seal.current_price);
+    let change_w = text_width(&change_label, 16.0);
+    let price_w = text_width(&price_label, 18.0);
+    let total_w = price_w + change_w + 8;
+    let price_x = right_edge - total_w - padding;
+
+    draw_text_mut(canvas, TEXT_PRIMARY, price_x as i32, (center_y - 28) as i32,
+        PxScale::from(18.0), font_bold, &price_label);
+    draw_text_mut(canvas, change_color, (price_x + price_w + 8) as i32, (center_y - 26) as i32,
+        PxScale::from(16.0), font_bold, &change_label);
+
+    // Volume + previous price on second line
+    let detail = format!("{} sold  (was ${:.2})", seal.volume_48h, seal.previous_price);
+    draw_text_mut(canvas, TEXT_SECONDARY, text_x as i32, (center_y + 4) as i32,
+        PxScale::from(14.0), font_regular, &detail);
+}
+
+/// Generate a comparison graphic for Seals: Origins (left) vs Overnumbered (right).
+pub async fn generate_seals_graphic(
+    origins_seals: &[SealData],
+    overnumbered_seals: &[SealData],
+    title: &str,
+    output_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if origins_seals.is_empty() && overnumbered_seals.is_empty() {
+        return Err("No seal data to render".into());
+    }
+
+    let font_bold = FontRef::try_from_slice(FONT_BOLD)?;
+    let font_regular = FontRef::try_from_slice(FONT_REGULAR)?;
+    let client = reqwest::Client::new();
+
+    let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
+    draw_chrome(&mut canvas, &font_bold, title, WIDTH, HEIGHT);
+
+    let content_top = 70u32;
+    let content_bottom = HEIGHT - 16;
+    let content_h = content_bottom - content_top;
+    let section_top = content_top + 26;
+
+    let half_w = WIDTH / 2 - 4;
+    let right_x = WIDTH / 2 + 4;
+
+    // Download images for both sets concurrently
+    let left_entries: Vec<CardEntry> = origins_seals.iter().map(|s| CardEntry {
+        product_id: s.product_id, product_name: s.name.clone(),
+        display_name: s.name.clone(), total_qty: s.volume_48h,
+        rarity: "Epic".to_string(), fallback_product_id: None,
+        avg_price: s.current_price, price_change_pct: Some(s.change_pct),
+    }).collect();
+    let right_entries: Vec<CardEntry> = overnumbered_seals.iter().map(|s| CardEntry {
+        product_id: s.product_id, product_name: s.name.clone(),
+        display_name: s.name.clone(), total_qty: s.volume_48h,
+        rarity: "Showcase".to_string(), fallback_product_id: None,
+        avg_price: s.current_price, price_change_pct: Some(s.change_pct),
+    }).collect();
+
+    let left_images = download_images(&client, &left_entries).await;
+    let right_images = download_images(&client, &right_entries).await;
+
+    // === Left column: Origins Seals ===
+    draw_text_mut(&mut canvas, ACCENT, 18, (content_top + 2) as i32,
+        PxScale::from(16.0), &font_bold, "ORIGINS SEALS");
+
+    let left_count = origins_seals.len().max(1) as u32;
+    let left_row_h = (content_h - 26) / left_count;
+
+    for (i, seal) in origins_seals.iter().enumerate() {
+        let row_y = section_top + (i as u32) * left_row_h;
+        draw_seal_row(&mut canvas, &font_bold, &font_regular, seal,
+            &left_images[i], i, row_y, left_row_h, 0, half_w);
+    }
+
+    // Vertical divider
+    draw_filled_rect_mut(&mut canvas,
+        Rect::at((WIDTH / 2) as i32, content_top as i32).of_size(2, content_h),
+        Rgba([40, 40, 60, 255]));
+
+    // === Right column: Overnumbered Seals ===
+    draw_text_mut(&mut canvas, ACCENT, (right_x + 6) as i32, (content_top + 2) as i32,
+        PxScale::from(16.0), &font_bold, "OVERNUMBERED SEALS");
+
+    let right_count = overnumbered_seals.len().max(1) as u32;
+    let right_row_h = (content_h - 26) / right_count;
+
+    for (i, seal) in overnumbered_seals.iter().enumerate() {
+        let row_y = section_top + (i as u32) * right_row_h;
+        draw_seal_row(&mut canvas, &font_bold, &font_regular, seal,
+            &right_images[i], i, row_y, right_row_h, right_x, half_w);
     }
 
     canvas.save(output_path)?;

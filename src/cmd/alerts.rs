@@ -696,6 +696,65 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+/// Query seal card data (price, volume, change) from the databases.
+/// `pattern` is a SQL LIKE pattern (e.g. "Seal of %").
+/// `overnumbered` filters to only overnumbered variants when true, or excludes them when false.
+fn query_seals(conns: &[&Connection], pattern: &str, overnumbered: bool) -> Vec<super::graphic::SealData> {
+    let mut seals = Vec::new();
+
+    for conn in conns {
+        let mut stmt = match conn.prepare(
+            "SELECT c.product_id, c.product_name,
+                    v1.market_price, v2.market_price,
+                    COALESCE(SUM(v1.quantity_sold), 0)
+             FROM daily_volume v1
+             JOIN daily_volume v2 ON v1.product_id = v2.product_id
+                  AND v2.variant = v1.variant AND v2.condition = v1.condition
+             JOIN cards c ON c.product_id = v1.product_id
+             WHERE c.product_name LIKE ?1
+               AND v1.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
+               AND v2.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume
+                                     WHERE bucket_date < (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
+                                       AND quantity_sold > 0)
+               AND v1.market_price > 0 AND v2.market_price > 0
+               AND v1.condition = 'Near Mint'
+             GROUP BY v1.product_id
+             ORDER BY c.product_name",
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let rows = stmt.query_map([pattern], |row| {
+            let current: f64 = row.get(2)?;
+            let previous: f64 = row.get(3)?;
+            let pct = if previous > 0.0 { (current - previous) / previous * 100.0 } else { 0.0 };
+            Ok(super::graphic::SealData {
+                product_id: row.get::<_, i64>(0)? as u64,
+                name: row.get(1)?,
+                current_price: current,
+                previous_price: previous,
+                change_pct: pct,
+                volume_48h: row.get(4)?,
+            })
+        }).ok();
+
+        if let Some(rows) = rows {
+            for seal in rows.filter_map(|r| r.ok()) {
+                let is_over = seal.name.contains("(Overnumbered)");
+                if overnumbered == is_over {
+                    seals.push(seal);
+                }
+            }
+        }
+    }
+
+    // Deduplicate by name (keep first seen)
+    let mut seen = std::collections::HashSet::new();
+    seals.retain(|s| seen.insert(s.name.clone()));
+    seals
+}
+
 /// Run alerts for multiple profiles, using SQLite when fresh.
 pub async fn run(
     profile_names: &[String],
@@ -811,6 +870,25 @@ pub async fn run(
                     match super::x_post::post_graphic(&post_path, &tweet_text).await {
                         Ok(url) => println!("  Posted to X: {}", url),
                         Err(e) => eprintln!("  Failed to post to X: {}", e),
+                    }
+                }
+            }
+
+            // Generate seals comparison graphic
+            {
+                let origins_seals = query_seals(&conn_refs, "Seal of %", false);
+                let overnumbered_seals = query_seals(&conn_refs, "Seal of % (Overnumbered)", true);
+                if !origins_seals.is_empty() || !overnumbered_seals.is_empty() {
+                    let seals_title = format!("Riftbound Seals — {} to {}", start_date, end_date);
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                    let ext = path.extension().unwrap_or_default().to_string_lossy();
+                    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+                    let seals_path = parent.join(format!("{}_seals.{}", stem, ext));
+                    match super::graphic::generate_seals_graphic(
+                        &origins_seals, &overnumbered_seals, &seals_title, &seals_path,
+                    ).await {
+                        Ok(()) => println!("  Seals graphic saved to {}", seals_path.display()),
+                        Err(e) => eprintln!("  Failed to generate seals graphic: {}", e),
                     }
                 }
             }
