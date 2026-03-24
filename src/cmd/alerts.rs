@@ -41,6 +41,10 @@ pub(crate) struct CardEntry {
     pub(crate) rarity: String,
     /// Fallback product_id for image lookup (e.g. base card for alt art variants).
     pub(crate) fallback_product_id: Option<u64>,
+    /// Current average price over the window.
+    pub(crate) avg_price: f64,
+    /// Price change percentage over the 48h window (positive = up, negative = down).
+    pub(crate) price_change_pct: Option<f64>,
 }
 
 /// Card selection for the graphic: top overall + top per rarity.
@@ -117,6 +121,34 @@ fn lookup_card_number(conns: &[&Connection], product_id: u64) -> Option<String> 
             .ok()?;
         if result.is_some() {
             return result;
+        }
+    }
+    None
+}
+
+/// Look up the price change percentage for a card over the last 48h from daily_volume.
+/// Compares the most recent day's market_price to the oldest day in the window.
+fn lookup_price_change(conns: &[&Connection], product_id: u64) -> Option<f64> {
+    for conn in conns {
+        // Get the two most recent daily prices for this card
+        let mut stmt = conn
+            .prepare(
+                "SELECT market_price FROM daily_volume
+                 WHERE product_id = ?1 AND market_price IS NOT NULL AND market_price > 0
+                 ORDER BY bucket_date DESC LIMIT 2",
+            )
+            .ok()?;
+        let prices: Vec<f64> = stmt
+            .query_map([product_id as i64], |row| row.get(0))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        if prices.len() == 2 {
+            let current = prices[0];
+            let previous = prices[1];
+            if previous > 0.0 {
+                return Some((current - previous) / previous * 100.0);
+            }
         }
     }
     None
@@ -468,6 +500,8 @@ fn make_card_entry(row: &TopPurchased, conn_refs: &[&Connection]) -> CardEntry {
         row.product_name.clone()
     };
 
+    let price_change = lookup_price_change(conn_refs, row.product_id);
+
     CardEntry {
         product_id: row.product_id,
         product_name: row.product_name.clone(),
@@ -475,6 +509,8 @@ fn make_card_entry(row: &TopPurchased, conn_refs: &[&Connection]) -> CardEntry {
         total_qty: row.total_qty,
         rarity: row.rarity.clone(),
         fallback_product_id: fallback,
+        avg_price: row.avg_price,
+        price_change_pct: price_change,
     }
 }
 

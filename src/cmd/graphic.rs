@@ -18,6 +18,9 @@ const CARD_BG: Rgba<u8> = Rgba([30, 30, 48, 255]);
 const ACCENT: Rgba<u8> = Rgba([99, 102, 241, 255]);
 const TEXT_PRIMARY: Rgba<u8> = Rgba([240, 240, 245, 255]);
 const TEXT_SECONDARY: Rgba<u8> = Rgba([160, 160, 180, 255]);
+const PRICE_UP: Rgba<u8> = Rgba([80, 200, 120, 255]);    // green
+const PRICE_DOWN: Rgba<u8> = Rgba([240, 80, 80, 255]);   // red
+const PRICE_FLAT: Rgba<u8> = Rgba([160, 160, 180, 255]); // gray
 const BAR_COLORS: [Rgba<u8>; 5] = [
     Rgba([99, 102, 241, 255]),  // indigo
     Rgba([79, 140, 255, 255]),  // blue
@@ -176,7 +179,7 @@ fn draw_row(
     draw_filled_rect_mut(canvas, Rect::at((thumb_x + thumb_size - 2) as i32, thumb_y as i32).of_size(2, thumb_size), border_color);
 
     // Card name
-    let name = truncate(&card.display_name, 38);
+    let name = truncate(&card.display_name, 28);
     draw_text_mut(
         canvas,
         TEXT_PRIMARY,
@@ -187,18 +190,37 @@ fn draw_row(
         &name,
     );
 
-    // Rarity label (if showing by-rarity section)
-    if show_rarity && !card.rarity.is_empty() {
-        let name_width = name.len() as u32 * 10 + 8;
-        let rc = rarity_color(&card.rarity);
+    // Price + change after the card name
+    let price_x = bar_x + name.len() as u32 * 10 + 8;
+    let price_label = format!("${:.2}", card.avg_price);
+    draw_text_mut(
+        canvas,
+        TEXT_SECONDARY,
+        price_x as i32,
+        (center_y - 22) as i32,
+        PxScale::from(14.0),
+        font_regular,
+        &price_label,
+    );
+
+    if let Some(pct) = card.price_change_pct {
+        let (arrow, color) = if pct > 0.5 {
+            ("\u{25B2}", PRICE_UP) // ▲
+        } else if pct < -0.5 {
+            ("\u{25BC}", PRICE_DOWN) // ▼
+        } else {
+            ("-", PRICE_FLAT)
+        };
+        let change_label = format!("{}{:.1}%", arrow, pct.abs());
+        let change_x = price_x + price_label.len() as u32 * 8 + 6;
         draw_text_mut(
             canvas,
-            rc,
-            (bar_x + name_width) as i32,
+            color,
+            change_x as i32,
             (center_y - 22) as i32,
             PxScale::from(14.0),
-            font_regular,
-            &card.rarity,
+            font_bold,
+            &change_label,
         );
     }
 
@@ -296,6 +318,8 @@ pub async fn generate_graphic(
             total_qty: c.total_qty,
             rarity: c.rarity.clone(),
             fallback_product_id: c.fallback_product_id,
+            avg_price: c.avg_price,
+            price_change_pct: c.price_change_pct,
         })
         .collect();
     let all_images = download_images(&client, &all_entries).await;
@@ -447,7 +471,7 @@ pub async fn generate_graphic(
             draw_filled_rect_mut(&mut canvas, Rect::at((r_thumb_x + t_size - 2) as i32, thumb_y as i32).of_size(2, t_size), rc);
 
             // Card name
-            let name = truncate(&card.display_name, 28);
+            let name = truncate(&card.display_name, 22);
             draw_text_mut(
                 &mut canvas,
                 TEXT_PRIMARY,
@@ -458,16 +482,39 @@ pub async fn generate_graphic(
                 &name,
             );
 
-            // Rarity label
+            // Price + change after the card name
+            let r_price_x = r_bar_x + name.len() as u32 * 9 + 6;
+            let r_price_label = format!("${:.2}", card.avg_price);
             draw_text_mut(
                 &mut canvas,
-                rc,
-                (r_bar_x + name.len() as u32 * 9 + 6) as i32,
+                TEXT_SECONDARY,
+                r_price_x as i32,
                 (center_y - 22) as i32,
                 PxScale::from(13.0),
                 &font_regular,
-                &card.rarity,
+                &r_price_label,
             );
+
+            if let Some(pct) = card.price_change_pct {
+                let (arrow, color) = if pct > 0.5 {
+                    ("\u{25B2}", PRICE_UP)
+                } else if pct < -0.5 {
+                    ("\u{25BC}", PRICE_DOWN)
+                } else {
+                    ("-", PRICE_FLAT)
+                };
+                let change_label = format!("{}{:.1}%", arrow, pct.abs());
+                let r_change_x = r_price_x + r_price_label.len() as u32 * 7 + 4;
+                draw_text_mut(
+                    &mut canvas,
+                    color,
+                    r_change_x as i32,
+                    (center_y - 22) as i32,
+                    PxScale::from(13.0),
+                    &font_bold,
+                    &change_label,
+                );
+            }
 
             // Bar
             let bar_w = if max_qty_rarity > 0 {
