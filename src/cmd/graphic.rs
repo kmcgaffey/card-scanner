@@ -6,7 +6,7 @@ use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
 use imageproc::rect::Rect;
 
-use super::alerts::{CardEntry, GraphicCards};
+use super::alerts::{CardEntry, GraphicCards, PriceMover};
 
 // Canvas dimensions (Twitter-optimized 16:9)
 const WIDTH: u32 = 1200;
@@ -700,4 +700,169 @@ pub async fn generate_split_graphics(
     }
 
     Ok(paths)
+}
+
+/// Draw a single mover row with card image, name, price change bar, and labels.
+fn draw_mover_row(
+    canvas: &mut RgbaImage,
+    font_bold: &FontRef,
+    font_regular: &FontRef,
+    mover: &PriceMover,
+    image: &Option<DynamicImage>,
+    rank: usize,
+    row_y: u32,
+    row_h: u32,
+    is_gainer: bool,
+    max_pct: f64,
+    section_x: u32,
+    section_w: u32,
+) {
+    let center_y = row_y + row_h / 2;
+    let padding = 12u32;
+    let bar_color = if is_gainer { PRICE_UP } else { PRICE_DOWN };
+
+    // Alternating row background
+    if rank % 2 == 0 {
+        draw_filled_rect_mut(canvas,
+            Rect::at(section_x as i32, row_y as i32).of_size(section_w, row_h),
+            Rgba([22, 22, 36, 255]));
+    }
+
+    // Card image
+    let card_h = row_h.saturating_sub(8);
+    let card_w = (card_h as f32 * 0.715) as u32;
+    let thumb_x = section_x + padding;
+    let card_y = row_y + 4;
+    if let Some(ref img) = image {
+        let fitted = resize_fit(img, card_w, card_h);
+        let img_x = thumb_x + (card_w.saturating_sub(fitted.width())) / 2;
+        let img_y = card_y + (card_h.saturating_sub(fitted.height())) / 2;
+        image::imageops::overlay(canvas, &fitted, img_x as i64, img_y as i64);
+    }
+
+    let text_x = thumb_x + card_w + 10;
+    let right_edge = section_x + section_w;
+
+    // Card name
+    let name = truncate(&mover.product_name, 24);
+    draw_text_mut(canvas, TEXT_PRIMARY, text_x as i32, (center_y - 28) as i32,
+        PxScale::from(20.0), font_bold, &name);
+
+    // Price: was → now (right-justified)
+    let change_label = if is_gainer {
+        format!("+{:.1}%", mover.change_pct)
+    } else {
+        format!("{:.1}%", mover.change_pct)
+    };
+    let price_str = format!("${:.2} → ${:.2}", mover.previous_price, mover.current_price);
+    let change_w = text_width(&change_label, 16.0);
+    let price_w = text_width(&price_str, 14.0);
+    let total_w = price_w + change_w + 8;
+    let price_x = right_edge - total_w - padding;
+
+    draw_text_mut(canvas, TEXT_SECONDARY, price_x as i32, (center_y - 26) as i32,
+        PxScale::from(14.0), font_regular, &price_str);
+
+    draw_text_mut(canvas, bar_color, (price_x + price_w + 8) as i32, (center_y - 28) as i32,
+        PxScale::from(16.0), font_bold, &change_label);
+
+    // Percentage bar
+    let bar_max_w = ((right_edge - text_x - padding) as f32 * 0.65) as u32;
+    let bar_w = if max_pct > 0.0 {
+        (mover.change_pct.abs() / max_pct * bar_max_w as f64) as u32
+    } else { 0 };
+    let bar_h = 20u32;
+    let bar_y = center_y + 2;
+
+    draw_filled_rect_mut(canvas,
+        Rect::at(text_x as i32, bar_y as i32).of_size(bar_w.max(4), bar_h), bar_color);
+
+    // Volume label after bar
+    let vol_label = format!("{} sold", mover.volume);
+    draw_text_mut(canvas, TEXT_SECONDARY, (text_x + bar_w + 8) as i32, (bar_y + 2) as i32,
+        PxScale::from(14.0), font_regular, &vol_label);
+}
+
+/// Generate a graphic showing top gainers and losers side by side.
+pub async fn generate_movers_graphic(
+    gainers: &[PriceMover],
+    losers: &[PriceMover],
+    title: &str,
+    output_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if gainers.is_empty() && losers.is_empty() {
+        return Err("No price movers to render".into());
+    }
+
+    let font_bold = FontRef::try_from_slice(FONT_BOLD)?;
+    let font_regular = FontRef::try_from_slice(FONT_REGULAR)?;
+    let client = reqwest::Client::new();
+
+    let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
+    draw_chrome(&mut canvas, &font_bold, title, WIDTH, HEIGHT);
+
+    let content_top = 70u32;
+    let content_bottom = HEIGHT - 16;
+    let content_h = content_bottom - content_top;
+    let section_top = content_top + 26;
+
+    let half_w = WIDTH / 2 - 4;
+    let right_x = WIDTH / 2 + 4;
+
+    // Download all images concurrently
+    let top_gainers = &gainers[..gainers.len().min(5)];
+    let top_losers = &losers[..losers.len().min(5)];
+
+    let gainer_entries: Vec<CardEntry> = top_gainers.iter().map(|m| CardEntry {
+        product_id: m.product_id, product_name: m.product_name.clone(),
+        display_name: m.product_name.clone(), total_qty: m.volume,
+        rarity: m.rarity.clone(), fallback_product_id: None,
+        avg_price: m.current_price, price_change_pct: Some(m.change_pct),
+    }).collect();
+    let loser_entries: Vec<CardEntry> = top_losers.iter().map(|m| CardEntry {
+        product_id: m.product_id, product_name: m.product_name.clone(),
+        display_name: m.product_name.clone(), total_qty: m.volume,
+        rarity: m.rarity.clone(), fallback_product_id: None,
+        avg_price: m.current_price, price_change_pct: Some(m.change_pct),
+    }).collect();
+
+    let gainer_images = download_images(&client, &gainer_entries).await;
+    let loser_images = download_images(&client, &loser_entries).await;
+
+    // === Left column: Gainers ===
+    // Section header
+    draw_text_mut(&mut canvas, PRICE_UP, 18, (content_top + 2) as i32,
+        PxScale::from(16.0), &font_bold, "\u{25B2} BIGGEST GAINERS");
+
+    let row_count = top_gainers.len().max(1) as u32;
+    let row_h = (content_h - 26) / row_count;
+    let max_gain = top_gainers.iter().map(|m| m.change_pct).fold(0.0f64, f64::max);
+
+    for (i, mover) in top_gainers.iter().enumerate() {
+        let row_y = section_top + (i as u32) * row_h;
+        draw_mover_row(&mut canvas, &font_bold, &font_regular, mover,
+            &gainer_images[i], i, row_y, row_h, true, max_gain, 0, half_w);
+    }
+
+    // Vertical divider
+    draw_filled_rect_mut(&mut canvas,
+        Rect::at((WIDTH / 2) as i32, content_top as i32).of_size(2, content_h),
+        Rgba([40, 40, 60, 255]));
+
+    // === Right column: Losers ===
+    draw_text_mut(&mut canvas, PRICE_DOWN, (right_x + 6) as i32, (content_top + 2) as i32,
+        PxScale::from(16.0), &font_bold, "\u{25BC} BIGGEST DECLINERS");
+
+    let loser_count = top_losers.len().max(1) as u32;
+    let loser_row_h = (content_h - 26) / loser_count;
+    let max_loss = top_losers.iter().map(|m| m.change_pct.abs()).fold(0.0f64, f64::max);
+
+    for (i, mover) in top_losers.iter().enumerate() {
+        let row_y = section_top + (i as u32) * loser_row_h;
+        draw_mover_row(&mut canvas, &font_bold, &font_regular, mover,
+            &loser_images[i], i, row_y, loser_row_h, false, max_loss, right_x, half_w);
+    }
+
+    canvas.save(output_path)?;
+    Ok(())
 }
