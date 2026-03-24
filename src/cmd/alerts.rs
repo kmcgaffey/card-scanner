@@ -573,23 +573,28 @@ fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, 
 
     for conn in conns {
         let mut stmt = match conn.prepare(
-            "SELECT c.product_name, c.rarity, c.set_name,
-                    v1.market_price as current_price,
-                    v2.market_price as previous_price,
-                    SUM(v1.quantity_sold) as volume,
-                    v1.product_id
-             FROM daily_volume v1
-             JOIN daily_volume v2 ON v1.product_id = v2.product_id
-                  AND v2.variant = v1.variant AND v2.condition = v1.condition
-             JOIN cards c ON c.product_id = v1.product_id
-             WHERE v1.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
-               AND v2.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume
-                                     WHERE bucket_date < (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
-                                       AND quantity_sold > 0)
-               AND v1.market_price > 0 AND v2.market_price >= 0.50
-               AND v1.condition = 'Near Mint'
-             GROUP BY v1.product_id
-             ORDER BY ABS((v1.market_price - v2.market_price) / v2.market_price) DESC",
+            "WITH ranked AS (
+                SELECT c.product_name, c.rarity, c.set_name,
+                       v1.market_price as current_price,
+                       v2.market_price as previous_price,
+                       v1.quantity_sold as volume,
+                       v1.product_id,
+                       v1.variant,
+                       ROW_NUMBER() OVER (PARTITION BY v1.product_id ORDER BY v1.quantity_sold DESC) as rn
+                FROM daily_volume v1
+                JOIN daily_volume v2 ON v1.product_id = v2.product_id
+                     AND v2.variant = v1.variant AND v2.condition = v1.condition
+                JOIN cards c ON c.product_id = v1.product_id
+                WHERE v1.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
+                  AND v2.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume
+                                        WHERE bucket_date < (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
+                                          AND quantity_sold > 0)
+                  AND v1.market_price > 0 AND v2.market_price >= 0.50
+                  AND v1.condition = 'Near Mint'
+             )
+             SELECT product_name, rarity, set_name, current_price, previous_price, volume, product_id
+             FROM ranked WHERE rn = 1
+             ORDER BY ABS((current_price - previous_price) / previous_price) DESC",
         ) {
             Ok(s) => s,
             Err(_) => continue,
