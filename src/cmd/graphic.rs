@@ -112,6 +112,23 @@ async fn download_images(
     images
 }
 
+/// Format a price change as arrow + percentage string.
+fn format_price_change(pct: f64) -> (String, Rgba<u8>) {
+    if pct > 0.5 {
+        (format!("\u{25B2}{:.1}%", pct.abs()), PRICE_UP)
+    } else if pct < -0.5 {
+        (format!("\u{25BC}{:.1}%", pct.abs()), PRICE_DOWN)
+    } else {
+        ("-0.0%".to_string(), PRICE_FLAT)
+    }
+}
+
+/// Estimate text width in pixels for a given font size (approximate).
+fn text_width(s: &str, font_size: f32) -> u32 {
+    // Approximate character width as 0.55 * font_size for Inter font
+    (s.len() as f32 * font_size * 0.55) as u32
+}
+
 /// Draw a single row in the bar chart section.
 fn draw_row(
     canvas: &mut RgbaImage,
@@ -127,7 +144,7 @@ fn draw_row(
     bar_max_w: u32,
     max_qty: u32,
     padding: u32,
-    show_rarity: bool,
+    right_edge: u32,
 ) {
     let center_y = row_y + row_h / 2;
 
@@ -135,7 +152,7 @@ fn draw_row(
     if rank % 2 == 0 {
         draw_filled_rect_mut(
             canvas,
-            Rect::at(0, row_y as i32).of_size(WIDTH, row_h),
+            Rect::at(0, row_y as i32).of_size(right_edge, row_h),
             Rgba([22, 22, 36, 255]),
         );
     }
@@ -155,7 +172,7 @@ fn draw_row(
 
     // Full card image (scaled to fit row height)
     let card_h = row_h.saturating_sub(8);
-    let card_w = (card_h as f32 * 0.715) as u32; // ~5:7 card aspect ratio
+    let card_w = (card_h as f32 * 0.715) as u32;
     let card_y = row_y + 4;
     if let Some(ref img) = image {
         let fitted = resize_fit(img, card_w, card_h);
@@ -164,7 +181,7 @@ fn draw_row(
         image::imageops::overlay(canvas, &fitted, img_x as i64, img_y as i64);
     }
 
-    // Card name
+    // Card name (left-aligned)
     let name = truncate(&card.display_name, 28);
     draw_text_mut(
         canvas,
@@ -176,9 +193,14 @@ fn draw_row(
         &name,
     );
 
-    // Price + change after the card name
-    let price_x = bar_x + name.len() as u32 * 10 + 8;
+    // Price + change (right-justified)
+    let change_str = card.price_change_pct.map(|pct| format_price_change(pct));
     let price_label = format!("${:.2}", card.avg_price);
+    let change_w = change_str.as_ref().map(|(s, _)| text_width(s, 14.0) + 4).unwrap_or(0);
+    let price_w = text_width(&price_label, 14.0);
+    let total_price_w = price_w + change_w + 4;
+    let price_x = right_edge - total_price_w - padding;
+
     draw_text_mut(
         canvas,
         TEXT_SECONDARY,
@@ -189,41 +211,29 @@ fn draw_row(
         &price_label,
     );
 
-    if let Some(pct) = card.price_change_pct {
-        let (arrow, color) = if pct > 0.5 {
-            ("\u{25B2}", PRICE_UP) // ▲
-        } else if pct < -0.5 {
-            ("\u{25BC}", PRICE_DOWN) // ▼
-        } else {
-            ("-", PRICE_FLAT)
-        };
-        let change_label = format!("{}{:.1}%", arrow, pct.abs());
-        let change_x = price_x + price_label.len() as u32 * 8 + 6;
+    if let Some((label, color)) = &change_str {
         draw_text_mut(
             canvas,
-            color,
-            change_x as i32,
+            *color,
+            (price_x + price_w + 4) as i32,
             (center_y - 22) as i32,
             PxScale::from(14.0),
             font_bold,
-            &change_label,
+            label,
         );
     }
 
-    // Horizontal bar
+    // Horizontal bar (cap width so it doesn't overlap price)
+    let available_bar_w = (price_x.saturating_sub(bar_x).saturating_sub(8)).min(bar_max_w);
     let bar_w = if max_qty > 0 {
-        (card.total_qty as f64 / max_qty as f64 * bar_max_w as f64) as u32
+        (card.total_qty as f64 / max_qty as f64 * available_bar_w as f64) as u32
     } else {
         0
     };
     let bar_h = 22u32;
     let bar_y = center_y + 2;
 
-    let bar_color = if show_rarity {
-        rarity_color(&card.rarity)
-    } else {
-        BAR_COLORS[rank % BAR_COLORS.len()]
-    };
+    let bar_color = BAR_COLORS[rank % BAR_COLORS.len()];
     draw_filled_rect_mut(
         canvas,
         Rect::at(bar_x as i32, bar_y as i32).of_size(bar_w.max(4), bar_h),
@@ -383,7 +393,7 @@ pub async fn generate_graphic(
             bar_max_w,
             max_qty_overall,
             padding,
-            false,
+            left_w,
         );
     }
 
@@ -441,8 +451,8 @@ pub async fn generate_graphic(
                 image::imageops::overlay(&mut canvas, &fitted, img_x as i64, img_y as i64);
             }
 
-            // Card name
-            let name = truncate(&card.display_name, 22);
+            // Card name (left-aligned)
+            let name = truncate(&card.display_name, 20);
             draw_text_mut(
                 &mut canvas,
                 TEXT_PRIMARY,
@@ -453,9 +463,26 @@ pub async fn generate_graphic(
                 &name,
             );
 
-            // Price + change after the card name
-            let r_price_x = r_bar_x + name.len() as u32 * 9 + 6;
+            // Rarity label after card name
+            let rarity_x = r_bar_x + text_width(&name, 16.0) + 6;
+            draw_text_mut(
+                &mut canvas,
+                rc,
+                rarity_x as i32,
+                (center_y - 22) as i32,
+                PxScale::from(13.0),
+                &font_regular,
+                &card.rarity,
+            );
+
+            // Price + change (right-justified)
+            let r_change_str = card.price_change_pct.map(|pct| format_price_change(pct));
             let r_price_label = format!("${:.2}", card.avg_price);
+            let r_change_w = r_change_str.as_ref().map(|(s, _)| text_width(s, 13.0) + 4).unwrap_or(0);
+            let r_price_w = text_width(&r_price_label, 13.0);
+            let r_total_w = r_price_w + r_change_w + 4;
+            let r_price_x = WIDTH - r_total_w - 16;
+
             draw_text_mut(
                 &mut canvas,
                 TEXT_SECONDARY,
@@ -466,24 +493,15 @@ pub async fn generate_graphic(
                 &r_price_label,
             );
 
-            if let Some(pct) = card.price_change_pct {
-                let (arrow, color) = if pct > 0.5 {
-                    ("\u{25B2}", PRICE_UP)
-                } else if pct < -0.5 {
-                    ("\u{25BC}", PRICE_DOWN)
-                } else {
-                    ("-", PRICE_FLAT)
-                };
-                let change_label = format!("{}{:.1}%", arrow, pct.abs());
-                let r_change_x = r_price_x + r_price_label.len() as u32 * 7 + 4;
+            if let Some((label, color)) = &r_change_str {
                 draw_text_mut(
                     &mut canvas,
-                    color,
-                    r_change_x as i32,
+                    *color,
+                    (r_price_x + r_price_w + 4) as i32,
                     (center_y - 22) as i32,
                     PxScale::from(13.0),
                     &font_bold,
-                    &change_label,
+                    label,
                 );
             }
 

@@ -553,6 +553,160 @@ fn build_graphic_cards(rows: &[TopPurchased], conn_refs: &[&Connection]) -> Grap
     }
 }
 
+/// A card with a significant price change over the window.
+struct PriceMover {
+    product_name: String,
+    rarity: String,
+    set_name: String,
+    current_price: f64,
+    previous_price: f64,
+    change_pct: f64,
+    volume: u32,
+}
+
+/// Query cards with the biggest price changes from daily_volume across all connections.
+fn query_price_movers(conns: &[&Connection], top_n: usize) -> (Vec<PriceMover>, Vec<PriceMover>) {
+    let mut all_movers: Vec<PriceMover> = Vec::new();
+
+    for conn in conns {
+        let mut stmt = match conn.prepare(
+            "SELECT c.product_name, c.rarity, c.set_name,
+                    v1.market_price as current_price,
+                    v2.market_price as previous_price,
+                    SUM(v1.quantity_sold) as volume
+             FROM daily_volume v1
+             JOIN daily_volume v2 ON v1.product_id = v2.product_id
+                  AND v2.variant = v1.variant AND v2.condition = v1.condition
+             JOIN cards c ON c.product_id = v1.product_id
+             WHERE v1.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
+               AND v2.bucket_date = (SELECT MAX(bucket_date) FROM daily_volume
+                                     WHERE bucket_date < (SELECT MAX(bucket_date) FROM daily_volume WHERE quantity_sold > 0)
+                                       AND quantity_sold > 0)
+               AND v1.market_price > 0 AND v2.market_price > 0
+               AND v1.condition = 'Near Mint'
+             GROUP BY v1.product_id
+             ORDER BY ABS((v1.market_price - v2.market_price) / v2.market_price) DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let rows = stmt
+            .query_map([], |row| {
+                let current: f64 = row.get(3)?;
+                let previous: f64 = row.get(4)?;
+                let pct = (current - previous) / previous * 100.0;
+                Ok(PriceMover {
+                    product_name: row.get(0)?,
+                    rarity: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    set_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    current_price: current,
+                    previous_price: previous,
+                    change_pct: pct,
+                    volume: row.get(5)?,
+                })
+            })
+            .ok();
+
+        if let Some(rows) = rows {
+            all_movers.extend(rows.filter_map(|r| r.ok()));
+        }
+    }
+
+    // Split into gainers and losers, sorted by magnitude
+    let mut gainers: Vec<PriceMover> = all_movers.iter()
+        .filter(|m| m.change_pct > 1.0)
+        .map(|m| PriceMover {
+            product_name: m.product_name.clone(),
+            rarity: m.rarity.clone(),
+            set_name: m.set_name.clone(),
+            current_price: m.current_price,
+            previous_price: m.previous_price,
+            change_pct: m.change_pct,
+            volume: m.volume,
+        })
+        .collect();
+    gainers.sort_by(|a, b| b.change_pct.partial_cmp(&a.change_pct).unwrap_or(std::cmp::Ordering::Equal));
+    gainers.truncate(top_n);
+
+    let mut losers: Vec<PriceMover> = all_movers.iter()
+        .filter(|m| m.change_pct < -1.0)
+        .map(|m| PriceMover {
+            product_name: m.product_name.clone(),
+            rarity: m.rarity.clone(),
+            set_name: m.set_name.clone(),
+            current_price: m.current_price,
+            previous_price: m.previous_price,
+            change_pct: m.change_pct,
+            volume: m.volume,
+        })
+        .collect();
+    losers.sort_by(|a, b| a.change_pct.partial_cmp(&b.change_pct).unwrap_or(std::cmp::Ordering::Equal));
+    losers.truncate(top_n);
+
+    (gainers, losers)
+}
+
+fn print_price_movers(gainers: &[PriceMover], losers: &[PriceMover]) {
+    if !gainers.is_empty() {
+        println!("\n  Biggest Gainers:");
+        println!(
+            "    {:<40} {:>8} {:>8} {:>8} {:>7} {}",
+            "Card", "Was", "Now", "Change", "Vol", "Set"
+        );
+        println!("    {}", "-".repeat(95));
+        for m in gainers {
+            let set = if m.set_name.len() > 15 {
+                format!("{}...", &m.set_name[..12])
+            } else {
+                m.set_name.clone()
+            };
+            println!(
+                "    {:<40} {:>8} {:>8} {:>7} {:>7} {}",
+                truncate_str(&m.product_name, 39),
+                format!("${:.2}", m.previous_price),
+                format!("${:.2}", m.current_price),
+                format!("+{:.1}%", m.change_pct),
+                m.volume,
+                set,
+            );
+        }
+    }
+
+    if !losers.is_empty() {
+        println!("\n  Biggest Decliners:");
+        println!(
+            "    {:<40} {:>8} {:>8} {:>8} {:>7} {}",
+            "Card", "Was", "Now", "Change", "Vol", "Set"
+        );
+        println!("    {}", "-".repeat(95));
+        for m in losers {
+            let set = if m.set_name.len() > 15 {
+                format!("{}...", &m.set_name[..12])
+            } else {
+                m.set_name.clone()
+            };
+            println!(
+                "    {:<40} {:>8} {:>8} {:>7} {:>7} {}",
+                truncate_str(&m.product_name, 39),
+                format!("${:.2}", m.previous_price),
+                format!("${:.2}", m.current_price),
+                format!("{:.1}%", m.change_pct),
+                m.volume,
+                set,
+            );
+        }
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    } else {
+        s.to_string()
+    }
+}
+
 /// Run alerts for multiple profiles, using SQLite when fresh.
 pub async fn run(
     profile_names: &[String],
@@ -607,6 +761,16 @@ pub async fn run(
         );
         println!("Sets: {}", fresh_sets.join(", "));
         print_top_by_rarity(&all_sqlite_rows, TOP_N);
+
+        // Price movers
+        {
+            let conn_refs: Vec<&Connection> = fresh_conns.iter().collect();
+            let (gainers, losers) = query_price_movers(&conn_refs, 10);
+            if !gainers.is_empty() || !losers.is_empty() {
+                println!("\n=== Biggest Price Changes (48h) ===");
+                print_price_movers(&gainers, &losers);
+            }
+        }
 
         // Build GraphicCards: top 5 overall + top 1 per rarity
         if chart || post {
