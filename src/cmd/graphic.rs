@@ -14,7 +14,6 @@ const HEIGHT: u32 = 675;
 
 // Colors
 const BG: Rgba<u8> = Rgba([18, 18, 30, 255]);
-const CARD_BG: Rgba<u8> = Rgba([30, 30, 48, 255]);
 const ACCENT: Rgba<u8> = Rgba([99, 102, 241, 255]);
 const TEXT_PRIMARY: Rgba<u8> = Rgba([240, 240, 245, 255]);
 const TEXT_SECONDARY: Rgba<u8> = Rgba([160, 160, 180, 255]);
@@ -55,7 +54,7 @@ const FONT_REGULAR: &[u8] = include_bytes!("../../assets/Inter-Regular.ttf");
 const CDN_BASE: &str = "https://product-images.tcgplayer.com/fit-in";
 
 async fn download_card_image(client: &reqwest::Client, product_id: u64) -> Option<DynamicImage> {
-    let url = format!("{}/200x200/{}.jpg", CDN_BASE, product_id);
+    let url = format!("{}/400x400/{}.jpg", CDN_BASE, product_id);
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -64,18 +63,13 @@ async fn download_card_image(client: &reqwest::Client, product_id: u64) -> Optio
     image::load_from_memory(&bytes).ok()
 }
 
-/// Resize and crop an image to fill a target area (cover mode).
-fn resize_cover(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
+/// Resize an image to fit within target dimensions, preserving aspect ratio.
+fn resize_fit(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
     let (iw, ih) = (img.width() as f32, img.height() as f32);
-    let scale = (target_w as f32 / iw).max(target_h as f32 / ih);
-    let new_w = (iw * scale).ceil() as u32;
-    let new_h = (ih * scale).ceil() as u32;
-    let resized = img.resize_exact(new_w, new_h, FilterType::Lanczos3);
-    let crop_x = (new_w.saturating_sub(target_w)) / 2;
-    let crop_y = (new_h.saturating_sub(target_h)) / 2;
-    resized
-        .crop_imm(crop_x, crop_y, target_w, target_h)
-        .to_rgba8()
+    let scale = (target_w as f32 / iw).min(target_h as f32 / ih);
+    let new_w = (iw * scale).round() as u32;
+    let new_h = (ih * scale).round() as u32;
+    img.resize_exact(new_w, new_h, FilterType::Lanczos3).to_rgba8()
 }
 
 /// Truncate a string to `max_len` characters, adding "..." if needed.
@@ -136,7 +130,6 @@ fn draw_row(
     show_rarity: bool,
 ) {
     let center_y = row_y + row_h / 2;
-    let thumb_size = (row_h - 12).min(80);
 
     // Alternating row background
     if rank % 2 == 0 {
@@ -160,23 +153,16 @@ fn draw_row(
         &rank_label,
     );
 
-    // Card art thumbnail
-    let thumb_y = center_y - thumb_size / 2;
-    draw_filled_rect_mut(
-        canvas,
-        Rect::at(thumb_x as i32, thumb_y as i32).of_size(thumb_size, thumb_size),
-        CARD_BG,
-    );
+    // Full card image (scaled to fit row height)
+    let card_h = row_h.saturating_sub(8);
+    let card_w = (card_h as f32 * 0.715) as u32; // ~5:7 card aspect ratio
+    let card_y = row_y + 4;
     if let Some(ref img) = image {
-        let fitted = resize_cover(img, thumb_size, thumb_size);
-        image::imageops::overlay(canvas, &fitted, thumb_x as i64, thumb_y as i64);
+        let fitted = resize_fit(img, card_w, card_h);
+        let img_x = thumb_x + (card_w.saturating_sub(fitted.width())) / 2;
+        let img_y = card_y + (card_h.saturating_sub(fitted.height())) / 2;
+        image::imageops::overlay(canvas, &fitted, img_x as i64, img_y as i64);
     }
-    // Thumbnail border
-    let border_color = BAR_COLORS[rank % BAR_COLORS.len()];
-    draw_filled_rect_mut(canvas, Rect::at(thumb_x as i32, thumb_y as i32).of_size(thumb_size, 2), border_color);
-    draw_filled_rect_mut(canvas, Rect::at(thumb_x as i32, (thumb_y + thumb_size - 2) as i32).of_size(thumb_size, 2), border_color);
-    draw_filled_rect_mut(canvas, Rect::at(thumb_x as i32, thumb_y as i32).of_size(2, thumb_size), border_color);
-    draw_filled_rect_mut(canvas, Rect::at((thumb_x + thumb_size - 2) as i32, thumb_y as i32).of_size(2, thumb_size), border_color);
 
     // Card name
     let name = truncate(&card.display_name, 28);
@@ -376,8 +362,8 @@ pub async fn generate_graphic(
     let overall_count = cards.top_overall.len().min(5) as u32;
     let row_h = (content_h - 26) / overall_count.max(1);
     let thumb_x = padding + 38;
-    let thumb_size = (row_h - 12).min(80);
-    let bar_x = thumb_x + thumb_size + 12;
+    let card_w = ((row_h.saturating_sub(8)) as f32 * 0.715) as u32;
+    let bar_x = thumb_x + card_w + 12;
     let bar_max_w = left_w - bar_x - 90;
     let max_qty_overall = cards.top_overall.iter().map(|c| c.total_qty).max().unwrap_or(1);
 
@@ -424,8 +410,8 @@ pub async fn generate_graphic(
         let rarity_count = cards.top_by_rarity.len() as u32;
         let rarity_row_h = (content_h - 26) / rarity_count.max(1);
         let r_thumb_x = right_x + padding + 2;
-        let r_thumb_size = (rarity_row_h - 12).min(80);
-        let r_bar_x = r_thumb_x + r_thumb_size + 12;
+        let r_card_w = ((rarity_row_h.saturating_sub(8)) as f32 * 0.715) as u32;
+        let r_bar_x = r_thumb_x + r_card_w + 12;
         let r_bar_max_w = WIDTH - r_bar_x - 90;
         let max_qty_rarity = cards.top_by_rarity.iter().map(|c| c.total_qty).max().unwrap_or(1);
 
@@ -443,32 +429,17 @@ pub async fn generate_graphic(
                 );
             }
 
-            // Rarity badge
             let rc = rarity_color(&card.rarity);
-            let badge_w = card.rarity.len() as u32 * 8 + 12;
-            draw_filled_rect_mut(
-                &mut canvas,
-                Rect::at((r_thumb_x - 2) as i32, (center_y - 10) as i32).of_size(badge_w, 20),
-                Rgba([rc.0[0], rc.0[1], rc.0[2], 50]),
-            );
 
-            // Card art thumbnail
-            let t_size = r_thumb_size;
-            let thumb_y = center_y - t_size / 2;
-            draw_filled_rect_mut(
-                &mut canvas,
-                Rect::at(r_thumb_x as i32, thumb_y as i32).of_size(t_size, t_size),
-                CARD_BG,
-            );
+            // Full card image
+            let r_card_h = rarity_row_h.saturating_sub(8);
+            let card_y = row_y + 4;
             if let Some(ref img) = rarity_images[i] {
-                let fitted = resize_cover(img, t_size, t_size);
-                image::imageops::overlay(&mut canvas, &fitted, r_thumb_x as i64, thumb_y as i64);
+                let fitted = resize_fit(img, r_card_w, r_card_h);
+                let img_x = r_thumb_x + (r_card_w.saturating_sub(fitted.width())) / 2;
+                let img_y = card_y + (r_card_h.saturating_sub(fitted.height())) / 2;
+                image::imageops::overlay(&mut canvas, &fitted, img_x as i64, img_y as i64);
             }
-            // Rarity-colored border
-            draw_filled_rect_mut(&mut canvas, Rect::at(r_thumb_x as i32, thumb_y as i32).of_size(t_size, 2), rc);
-            draw_filled_rect_mut(&mut canvas, Rect::at(r_thumb_x as i32, (thumb_y + t_size - 2) as i32).of_size(t_size, 2), rc);
-            draw_filled_rect_mut(&mut canvas, Rect::at(r_thumb_x as i32, thumb_y as i32).of_size(2, t_size), rc);
-            draw_filled_rect_mut(&mut canvas, Rect::at((r_thumb_x + t_size - 2) as i32, thumb_y as i32).of_size(2, t_size), rc);
 
             // Card name
             let name = truncate(&card.display_name, 22);
