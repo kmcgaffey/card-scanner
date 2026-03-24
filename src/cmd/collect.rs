@@ -545,11 +545,19 @@ fn insert_price_point(
     .expect("Failed to insert price point");
 }
 
+fn is_non_english_sale(sale: &tcg_scanner::Sale) -> bool {
+    let lower = sale.title.to_lowercase();
+    NON_ENGLISH_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
 fn insert_sale(conn: &Connection, product_id: u64, sale: &tcg_scanner::Sale) -> bool {
+    if is_non_english_sale(sale) {
+        return false;
+    }
     let result = conn.execute(
         "INSERT OR IGNORE INTO sales (product_id, order_date, purchase_price, shipping_price,
-                                       condition, variant, language, quantity, listing_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                       condition, variant, language, quantity, listing_type, title)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             product_id,
             sale.order_date,
@@ -560,6 +568,7 @@ fn insert_sale(conn: &Connection, product_id: u64, sale: &tcg_scanner::Sale) -> 
             sale.language,
             sale.quantity,
             sale.listing_type,
+            sale.title,
         ],
     );
     match result {

@@ -167,6 +167,7 @@ pub fn init_db(conn: &Connection) {
             language        TEXT,
             quantity        INTEGER,
             listing_type    TEXT,
+            title           TEXT,
             UNIQUE(product_id, order_date, purchase_price, condition, variant, quantity),
             FOREIGN KEY (product_id) REFERENCES cards(product_id)
         );
@@ -195,6 +196,9 @@ pub fn init_db(conn: &Connection) {
         ",
     )
     .expect("Failed to initialize database schema");
+
+    // Migrate: add title column to existing sales tables
+    let _ = conn.execute("ALTER TABLE sales ADD COLUMN title TEXT", []);
 }
 
 /// Retry an async operation with exponential backoff.
